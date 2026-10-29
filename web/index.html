@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>music</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand"><span class="logo" aria-hidden="true"></span>music<span id="engine-badge" class="badge"></span></div>
+      <nav class="nav">
+        <a href="#/home" data-route="home"><span class="ico">⌂</span>Home</a>
+        <a href="#/queue" data-route="queue"><span class="ico">≡</span>Queue</a>
+        <a href="#/settings" data-route="settings"><span class="ico">⚙</span>Settings</a>
+      </nav>
+      <div class="lib-head">
+        <span>Your library</span>
+        <button id="new-playlist" class="icon-btn" title="New playlist" aria-label="New playlist">＋</button>
+      </div>
+      <div class="lib-list">
+        <a href="#/liked" data-route="liked" class="lib-item">
+          <span class="lib-art liked-art">♥</span>
+          <span class="lib-meta"><span class="lib-name">Liked songs</span><span id="liked-count" class="lib-sub"></span></span>
+        </a>
+        <div id="sidebar-playlists" class="sidebar-playlists"></div>
+      </div>
+    </aside>
+
+    <main class="main" id="main">
+      <form id="prompt-form" class="prompt-bar" autocomplete="off">
+        <span class="prompt-ico" aria-hidden="true">✦</span>
+        <input id="prompt" maxlength="200" placeholder="Ask for music… e.g. “rainy jazz with a tenor sax at 3am”" aria-label="Describe the music you want  (shortcut: /)">
+        <button class="pill accent" type="submit">Generate</button>
+      </form>
+      <div id="view" class="view"></div>
+    </main>
+  </div>
+
+  <footer class="player">
+    <div class="np">
+      <div id="np-art" class="art"></div>
+      <div class="np-meta">
+        <div id="np-name" class="np-name">Nothing playing</div>
+        <div id="np-sub" class="np-sub">Pick a radio or a playlist</div>
+      </div>
+      <button id="like" class="icon-btn" title="Like (l)" aria-label="Like">♡</button>
+      <button id="add-now" class="icon-btn" title="Add to playlist" aria-label="Add to playlist">＋</button>
+    </div>
+    <div class="transport">
+      <div class="buttons">
+        <button id="repeat" class="icon-btn repeat" title="Repeat: off" aria-label="Repeat: off">🔁</button>
+        <button id="play" class="play-btn" title="Play / pause (space)" aria-label="Play or pause">▶</button>
+        <button id="skip" class="icon-btn big" title="Next (n)" aria-label="Next">⏭</button>
+      </div>
+      <div class="timeline">
+        <span id="t-cur" class="t">0:00</span>
+        <div class="progress"><div id="song-bar"></div><div id="section-marks"></div></div>
+        <span id="t-total" class="t">0:00</span>
+      </div>
+      <div class="np-line"><span id="section" class="section-label"></span><span id="np-status" class="np-status"></span></div>
+    </div>
+    <div class="right">
+      <button id="download" class="icon-btn" title="Download" aria-label="Download">⤓</button>
+      <a href="#/queue" class="icon-btn" title="Queue" aria-label="Queue">≡</a>
+      <button id="device" class="icon-btn" title="Output device" aria-label="Output device">🔈</button>
+      <input id="volume" type="range" min="0" max="1" step="0.01" value="0.8" aria-label="Volume">
+    </div>
+  </footer>
+
+  <canvas id="viz" aria-hidden="true"></canvas>
+  <div id="menu" class="menu" role="menu" hidden></div>
+  <dialog id="dialog">
+    <form method="dialog" class="dialog-body">
+      <h3 id="dialog-title"></h3>
+      <p id="dialog-text"></p>
+      <input id="dialog-input" maxlength="60" aria-label="Name">
+      <div class="dialog-actions">
+        <button value="ok" id="dialog-ok" class="pill accent">OK</button>
+        <button value="cancel" class="pill">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+  <div id="toast" role="status"></div>
+  <script src="app.js"></script>
+</body>
+</html>

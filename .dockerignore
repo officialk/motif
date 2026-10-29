@@ -1,0 +1,12 @@
+.venv
+cache
+library
+soundfonts
+.git
+tests
+__pycache__
+*.pyc
+.pytest_cache
+.env
+*.env
+.claude
