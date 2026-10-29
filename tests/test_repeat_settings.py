@@ -53,8 +53,8 @@ def test_repeat_one_in_playlist_keeps_position(client):
 def test_ai_settings_roundtrip_and_validation(client):
     s = client.get("/settings").json()
     assert s["ai"]["backend"] == "off" and set(s["ai"]["keys"]) == {"anthropic", "openai"}
-    assert all(isinstance(v, bool) for v in s["ai"]["keys"].values())
-    assert s["storage"]["s3"] is False
+    assert all(set(v) == {"set", "source"} for v in s["ai"]["keys"].values())
+    assert s["storage"]["enabled"] is False
     try:
         r = client.put("/settings/ai", json={"backend": "openai", "model": "llama3.1", "ratio": 0.5,
                                               "base_url": "http://localhost:11434/v1"})
@@ -69,21 +69,45 @@ def test_ai_settings_roundtrip_and_validation(client):
         ai.set_settings(ai.AISettings.from_config())
 
 
-def test_prompt_with_ai_on_lets_ai_choose(client, monkeypatch):
-    def fake_make_spec(genre, mood, use_ai):
-        from app.generator import procedural
-        return procedural.generate(genre or "techno", mood), "openai"
+def test_prompt_with_ai_on_uses_one_playlist_call(client, monkeypatch):
+    import json as _json
+    from app.generator import procedural
 
-    monkeypatch.setattr(client.player, "spec_maker", fake_make_spec)
+    calls = []
+
+    def fake_backend(prompt, settings):
+        calls.append(prompt)
+        songs = [{"genre": "techno", "seed": 100 + i, "name": f"Cold Room {i}"} for i in range(7)]
+        songs.append({"genre": "techno", "seed": 100, "name": "Cold Room 0"})  # duplicate is dropped
+        songs.append({"genre": "polka", "seed": 5})  # invalid is skipped
+        return _json.dumps({"title": "Warehouse at 4am", "songs": songs})
+
+    monkeypatch.setitem(ai.BACKENDS, "openai", fake_backend)
     try:
         ai.set_settings(ai.AISettings(**{**ai.AISettings.from_config().__dict__, "backend": "openai"}))
         s = client.post("/prompt", json={"text": "something dark for a warehouse at 4am"}).json()
-        assert s["genre"] is None and s["mode"]["prompt"] is True
-        wait_ready(client, s["now"]["id"])
-        s = client.get("/state").json()
-        assert s["now"]["genre"] == "techno" and s["now"]["source"] == "openai"
     finally:
         ai.set_settings(ai.AISettings.from_config())
+    pl = s["playlist"]
+    assert len(calls) == 1 and "REQUEST_DATA" in calls[0]
+    assert pl["name"] == "Warehouse at 4am" and pl["count"] == 8 and pl["genres"] == ["techno"]
+    names = [x["name"] for x in pl["songs"]]
+    assert names[:7] == [f"Cold Room {i}" for i in range(7)] and len(set(pl["song_ids"])) == 8
+    assert [x["source"] for x in pl["songs"]].count("openai") == 7  # last one filled procedurally
+    assert procedural.generate("techno", seed=1).genre == "techno"
+
+
+def test_unlike_keeps_playlist_songs(client):
+    tracks = played_tracks(client, 1)
+    entry = client.post("/like", json={"id": tracks[0]}).json()["entry"]
+    pl = client.post("/playlists", json={"name": "Keep", "song_id": entry["id"]}).json()["playlist"]
+    assert client.delete(f"/library/{entry['id']}").status_code == 200
+    assert client.get("/library").json()["library"] == []
+    assert client.get(f"/playlists/{pl['id']}").json()["playlist"]["song_ids"] == [entry["id"]]
+    assert client.post("/like", json={"id": entry["id"]}).json()["already"] is False  # liked again
+    client.delete(f"/library/{entry['id']}")
+    client.delete(f"/playlists/{pl['id']}")
+    assert client.library.spec(entry["id"]) is None  # neither liked nor in a playlist: gone
 
 
 class FakeBackups:
@@ -91,7 +115,7 @@ class FakeBackups:
         self.made = []
 
     def backup(self, db_path):
-        item = {"key": f"music/backups/music-{len(self.made)}.db", "size": db_path.stat().st_size, "created": 1.0}
+        item = {"key": f"motif/backups/motif-{len(self.made)}.db", "size": db_path.path.stat().st_size, "created": 1.0}
         self.made.append(item)
         return item
 

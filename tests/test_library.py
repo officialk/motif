@@ -77,3 +77,51 @@ def test_json_files_imported_once(tmp_path, spec):
     assert not (root / "index.json").exists() and (root / "index.imported.json").exists()
     Library(root)  # second start: nothing imported twice
     assert len(lib.entries()) == 1 and len(lib.playlists()) == 1
+
+
+def test_legacy_music_db_is_renamed(tmp_path, spec):
+    old = Library(tmp_path / "lib", db_path=tmp_path / "lib" / "music.db")
+    old.like(spec, "procedural")
+    lib = Library(tmp_path / "lib")
+    assert lib.db_path.name == "motif.db" and not (tmp_path / "lib" / "music.db").exists()
+    assert [e["id"] for e in lib.entries()] == [spec.audio_hash()]
+
+
+def test_delete_song_removes_seed_playlists_history_and_audio(client):
+    first = play_one(client, "chiptune")
+    entry = client.post("/like", json={"id": first["id"]}).json()["entry"]
+    pl = client.post("/playlists", json={"name": "Mix", "song_id": entry["id"]}).json()["playlist"]
+    s = client.post("/skip", json={"from_id": first["id"]}).json()  # first song -> history
+    assert client.get("/history").json()["history"][0]["hash"] == entry["id"]
+    mp3 = client.player.engine.mp3_path(client.player.get(first["id"]).spec)
+    assert mp3.exists()
+
+    r = client.delete(f"/songs/{entry['id']}")
+    assert r.status_code == 200 and r.json()["deleted"] == {"saved": True, "history": 1}
+    assert client.get("/library").json()["library"] == []
+    assert client.get(f"/playlists/{pl['id']}").json()["playlist"]["count"] == 0
+    assert all(h["hash"] != entry["id"] for h in client.get("/history").json()["history"])
+    assert all(t["hash"] != entry["id"] for t in client.get("/state").json()["history"])
+    client.player.pool.submit(lambda: None).result()  # let the cache cleanup run
+    assert not mp3.exists()
+    assert client.delete(f"/songs/{entry['id']}").status_code == 404
+
+
+def test_delete_by_track_id_keeps_the_playing_song_audible(client):
+    now = play_one(client, "house")
+    r = client.delete(f"/songs/{now['id']}")  # not saved, not in history yet, but playing
+    assert r.status_code == 200 and r.json()["deleted"] == {"saved": False, "history": 0}
+    assert client.player.engine.mp3_path(client.player.get(now["id"]).spec).exists()
+    assert client.delete("/songs/nope").status_code == 404
+
+
+def test_history_skips_back_to_back_repeats_and_limit(tmp_path, spec):
+    lib = Library(tmp_path / "lib")
+    lib.record_history("t1", spec, "procedural")
+    lib.record_history("t2", spec, "procedural")  # same song again right after
+    assert [h["id"] for h in lib.history()] == ["t1"]
+    other = spec.model_copy(update={"seed": 99})
+    lib.record_history("t3", other, "procedural")
+    lib.record_history("t4", spec, "procedural")  # not back-to-back: recorded
+    assert [h["id"] for h in lib.history()] == ["t4", "t3", "t1"]
+    assert len(lib.history(limit=2)) == 2

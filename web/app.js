@@ -65,6 +65,16 @@ function mosaicHtml(cls, keys, fallback) {
   return `<div class="${cls} mosaic">${ks.map((k) => `<i ${artStyle(k)}></i>`).join("")}</div>`;
 }
 
+// Static icons in index.html are <el data-icon="name">; dynamic ones swap via setIcon.
+function fillIcons(root = document) {
+  for (const el of root.querySelectorAll("[data-icon]")) setIcon(el, el.dataset.icon);
+}
+function setIcon(el, name, cls = "") {
+  if (!el || el._icon === name) return;
+  el._icon = name;
+  el.innerHTML = icon(name, cls);
+}
+
 // Only touch the DOM when the markup actually changed (keeps hover/menus/inputs alive).
 function setHTML(el, html) {
   if (!el || el._html === html) return false;
@@ -82,10 +92,7 @@ class WebAudioOut {
     this.gapless = true;
     this.ctx = new Ctx();
     this.master = this.ctx.createGain();
-    this.analyser = this.ctx.createAnalyser();
-    this.analyser.fftSize = 128;
-    this.master.connect(this.analyser);
-    this.analyser.connect(this.ctx.destination);
+    this.master.connect(this.ctx.destination);
     this.loading = new Map(); // id -> Promise<AudioBuffer>
     this.ready = new Map();   // id -> AudioBuffer
     this.cur = null;          // { id, src, gain, start, music, track }
@@ -123,15 +130,37 @@ class WebAudioOut {
     }
   }
 
-  _voice(track, buf, when) {
+  // `start` is when the song's 0:00 is (or would have been) on the context clock, so
+  // position = currentTime - start holds after a seek too.
+  _voice(track, buf, when, offset = 0) {
     const src = this.ctx.createBufferSource();
     src.buffer = buf;
     const gain = this.ctx.createGain();
     src.connect(gain);
     gain.connect(this.master);
-    src.start(when);
+    src.start(when, offset);
     const music = Math.min(track.music_seconds || buf.duration, buf.duration);
-    return { id: track.id, src, gain, start: when, music, track };
+    return { id: track.id, src, gain, start: when - offset, music, track };
+  }
+
+  // Jump within the current song: restart its buffer at `t` with a very short crossfade.
+  // The prefetched next song is unscheduled; tick() schedules it again for the new end.
+  seek(t) {
+    const c = this.cur;
+    if (!c) return;
+    const buf = c.src.buffer;
+    t = Math.max(0, Math.min(t, buf.duration - 0.05));
+    this.cancelPending();
+    const now = this.ctx.currentTime + 0.02;
+    const g = c.gain.gain;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(g.value, now);
+    g.linearRampToValueAtTime(0, now + 0.03);
+    c.src.stop(now + 0.04);
+    const v = this._voice(c.track, buf, now, t);
+    v.gain.gain.setValueAtTime(0, now);
+    v.gain.gain.linearRampToValueAtTime(1, now + 0.03);
+    this.cur = v;
   }
 
   // Immediate switch (user action): short fade-out of the old song.
@@ -206,6 +235,7 @@ class ElementOut {
   }
   promote() { return false; }
   cancelPending() {}
+  seek(t) { if (this.cur) this.el.currentTime = Math.max(0, t); }
   position() {
     if (!this.cur) return null;
     return { t: this.el.currentTime, music: this.cur.music, track: this.cur.track };
@@ -361,11 +391,11 @@ async function loadHistory() {
   if (historyBusy) return;
   historyBusy = true;
   try {
-    recent = (await api("/history")).history || [];
+    recent = (await api("/history?limit=200")).history || [];
     recent.sort((a, b) => (b.played_at || 0) - (a.played_at || 0));
   } catch { /* keep previous */ }
   historyBusy = false;
-  if (route.name === "home") { renderView(); highlight(); }
+  if (route.name === "history") { renderView(); highlight(); }
 }
 
 async function loadSettings() {
@@ -375,7 +405,7 @@ async function loadSettings() {
     settings = { error: e.message };
   }
   backups = null;
-  if (settings?.storage?.s3) loadBackups();
+  if (settings?.storage?.enabled) loadBackups();
   if (route.name === "settings") renderView();
 }
 
@@ -445,21 +475,21 @@ function rowHtml(m, i) {
   const sub = [m.genre ? esc(genreLabel(m.genre)) : "", m.showStatus ? statusBadge(m.status) : ""].filter(Boolean).join(" ");
   const ready = !m.tid || m.status === "ready";
   const moves = m.ctx === "pl"
-    ? `<button class="icon-btn" data-a="row-up" ${k} title="Move up" aria-label="Move up" ${i === 0 ? "disabled" : ""}>↑</button>`
-      + `<button class="icon-btn" data-a="row-down" ${k} title="Move down" aria-label="Move down" ${m.last ? "disabled" : ""}>↓</button>`
+    ? `<button class="icon-btn" data-a="row-up" ${k} title="Move up" aria-label="Move up" ${i === 0 ? "disabled" : ""}>${icon("arrow_upward")}</button>`
+      + `<button class="icon-btn" data-a="row-down" ${k} title="Move down" aria-label="Move down" ${m.last ? "disabled" : ""}>${icon("arrow_downward")}</button>`
     : "";
   return `<div class="row" ${k} data-hash="${esc(m.hash || "")}" data-tid="${esc(m.tid || "")}" data-pl="${esc(m.plId || "")}">
-  <div class="num"><span class="n">${i + 1}</span><span class="eq" aria-hidden="true">♪</span><button class="p" data-a="row-play" ${k} title="Play" aria-label="Play" ${ready ? "" : "disabled"}>▶</button></div>
+  <div class="num"><span class="n">${i + 1}</span><span class="eq" aria-hidden="true">${icon("equalizer")}</span><button class="p" data-a="row-play" ${k} title="Play" aria-label="Play ${esc(m.name)}" ${ready ? "" : "disabled"}>${icon("play_arrow")}</button></div>
   <div class="song"><div class="art" ${artStyle(m.hash || m.id)}></div><div class="meta"><div class="title">${esc(m.name)}${tag}</div><div class="sub">${sub}</div></div></div>
   <div class="cell">${keyCell}</div>
   <div class="cell">${m.seconds ? fmtTime(m.seconds) : ""}</div>
-  <div class="acts">${moves}<button class="icon-btn like${isLiked ? " on" : ""}" data-a="row-like" ${k} title="${isLiked ? "Remove from Liked songs" : "Like"}" aria-label="Like" ${ready ? "" : "disabled"}>${isLiked ? "♥" : "♡"}</button><button class="icon-btn add" data-a="row-add" ${k} title="Add to playlist" aria-label="Add to playlist" ${ready ? "" : "disabled"}>＋</button><button class="icon-btn" data-a="row-more" ${k} title="More" aria-label="More">⋯</button></div>
+  <div class="acts">${moves}<button class="icon-btn like${isLiked ? " on" : ""}" data-a="row-like" ${k} title="${isLiked ? "Remove from Liked songs" : "Like"}" aria-label="${isLiked ? "Remove from Liked songs" : "Like"}" aria-pressed="${isLiked}" ${ready ? "" : "disabled"}>${icon(isLiked ? "favorite" : "favorite_border")}</button><button class="icon-btn add" data-a="row-add" ${k} title="Add to playlist" aria-label="Add to playlist" ${ready ? "" : "disabled"}>${icon("add")}</button><button class="icon-btn del" data-a="row-delete" ${k} title="Delete song" aria-label="Delete ${esc(m.name)}" ${ready ? "" : "disabled"}>${icon("delete")}</button><button class="icon-btn" data-a="row-more" ${k} title="More" aria-label="More">${icon("more_horiz")}</button></div>
 </div>`;
 }
 
 function rowsHtml(list, cls = "") {
   if (!list.length) return "";
-  return `<div class="rows ${cls}"><div class="row-head"><span>#</span><span>Title</span><span>Key · tempo</span><span>⏱</span><span></span></div>${list.map(rowHtml).join("")}</div>`;
+  return `<div class="rows ${cls}"><div class="row-head"><span>#</span><span>Title</span><span>Key · tempo</span><span title="Length" aria-label="Length">${icon("schedule")}</span><span></span></div>${list.map(rowHtml).join("")}</div>`;
 }
 
 // ---------- routing / views ----------
@@ -467,16 +497,35 @@ function parseRoute() {
   const h = location.hash.replace(/^#\/?/, "");
   const [name, ...rest] = h.split("/");
   if (name === "playlist" && rest[0]) return { name: "playlist", id: decodeURIComponent(rest.join("/")) };
-  if (["home", "queue", "settings", "liked"].includes(name)) return { name };
+  if (name === "queue") return { name: "history" }; // old links
+  if (["home", "history", "settings", "liked"].includes(name)) return { name };
   return { name: "home" };
 }
 
-function onRoute() {
-  route = parseRoute();
+let leaveOk = false;
+async function onRoute() {
+  const next = parseRoute();
+  // Leaving Settings with unsaved edits: put the hash back (no event) and ask first.
+  if (route.name === "settings" && next.name !== "settings" && !leaveOk && settingsDirty()) {
+    const target = location.hash;
+    history.replaceState(null, "", "#/settings");
+    const yes = await ask({ title: "Leave without saving?", text: "Your unsaved settings changes will be lost.", ok: "Discard changes", danger: true });
+    if (!yes) return;
+    leaveOk = true;
+    location.hash = target;
+    return;
+  }
+  leaveOk = false;
+  const entering = next.name === "settings" && route.name !== "settings";
+  route = next;
   closeMenu();
   for (const a of document.querySelectorAll("[data-route]")) a.classList.toggle("active", a.dataset.route === route.name);
-  if (route.name === "settings") loadSettings();
-  if (route.name === "home") loadHistory();
+  $("prompt-form").hidden = route.name !== "home"; // prompts live on Home only
+  if (route.name === "settings") {
+    if (entering) settings = null; // never show a stale form
+    loadSettings();
+  }
+  if (route.name === "history") loadHistory();
   if (route.name === "playlist") loadPlaylist(route.id);
   renderSidebar();
   renderView();
@@ -493,7 +542,7 @@ function renderView() {
     view._html = null;
     view.innerHTML = skeleton(route);
   }
-  ({ home: fillHome, queue: fillQueue, settings: fillSettings, liked: fillLiked, playlist: fillPlaylist })[route.name]();
+  ({ home: fillHome, history: fillHistory, settings: fillSettings, liked: fillLiked, playlist: fillPlaylist })[route.name]();
 }
 
 function skeleton(r) {
@@ -503,15 +552,11 @@ function skeleton(r) {
         <div class="section-title"><h2>Radios</h2><span class="muted">Endless songs in one genre</span></div>
         <div id="v-radios" class="tiles"></div>
         <div class="section-title"><h2>Your playlists</h2></div>
-        <div id="v-playlists"></div>
-        <div class="section-title"><h2>Recently played</h2></div>
-        <div id="v-recent"></div>`;
-    case "queue":
-      return `<h1>Queue</h1><h2>Now playing</h2><div id="v-now" class="queue-block"></div>
-        <h2>Up next</h2><div id="v-next" class="queue-block"></div>
-        <h2>This session</h2><div id="v-session"></div>`;
+        <div id="v-playlists"></div>`;
+    case "history":
+      return `<h1>Recently played</h1><div id="v-history-meta" class="muted"></div><div id="v-history" style="margin-top:12px"></div>`;
     case "liked":
-      return `<div class="hero"><div class="art liked-art">♥</div><div><div class="kind">PLAYLIST</div><h1>Liked songs</h1><div id="v-liked-meta" class="muted"></div></div></div>
+      return `<div class="hero"><div class="art liked-art">${icon("favorite")}</div><div><div class="kind">PLAYLIST</div><h1>Liked songs</h1><div id="v-liked-meta" class="muted"></div></div></div>
         <div class="toolbar">
           <input id="liked-q" type="search" placeholder="Search liked songs" aria-label="Search liked songs" value="${esc(liked.q)}">
           <select id="liked-sort" aria-label="Sort">
@@ -524,7 +569,8 @@ function skeleton(r) {
     case "playlist":
       return `<div id="v-pl-hero"></div><div id="v-pl-actions" class="actions"></div><div id="v-pl-rows"></div>`;
     case "settings":
-      return `<h1>Settings</h1><div id="v-ai"></div><div id="v-storage"></div>`;
+      return `<h1>Settings</h1>
+        <div id="v-ai"></div><div id="v-storage"></div><div id="v-backups"></div>`;
   }
   return "";
 }
@@ -542,30 +588,25 @@ function fillHome() {
   const radios = genres.map((g) => `<div class="tile" role="button" tabindex="0" data-a="radio" data-genre="${esc(g)}" title="Play ${esc(genreLabel(g))} radio">
       <div class="art genre-art" ${artStyle(`genre:${g}`)}><span>${esc(genreLabel(g))}</span></div>
       <div class="tile-name">${esc(genreLabel(g))} radio</div><div class="tile-sub">Procedural · endless</div>
-      <span class="hover-play" aria-hidden="true">▶</span></div>`).join("")
+      <span class="hover-play" aria-hidden="true">${icon("play_arrow")}</span></div>`).join("")
     + `<div class="tile" role="button" tabindex="0" data-a="shuffle-radios" data-genre="*shuffle" title="Shuffle radios">
-      <div class="art shuffle-art"><span>⤨</span></div>
+      <div class="art shuffle-art">${icon("shuffle")}</div>
       <div class="tile-name">Shuffle radios</div><div class="tile-sub">A new genre every song</div>
-      <span class="hover-play" aria-hidden="true">▶</span></div>`;
+      <span class="hover-play" aria-hidden="true">${icon("play_arrow")}</span></div>`;
   setHTML($("v-radios"), genres.length ? radios : '<div class="empty">Loading radios…</div>');
 
   setHTML($("v-playlists"), playlists.length
     ? `<div class="hscroll">${playlists.map((p) => `<div class="tile" role="button" tabindex="0" data-a="go" data-href="#/playlist/${enc(p.id)}" data-plid="${esc(p.id)}">
         ${playlistArt("art", p)}
         <div class="tile-name">${esc(p.name)}</div><div class="tile-sub">${p.count} song${p.count === 1 ? "" : "s"}</div>
-        <button class="hover-play" data-a="pl-play" data-pl="${esc(p.id)}" title="Play" aria-label="Play ${esc(p.name)}" ${p.count ? "" : "disabled"}>▶</button></div>`).join("")}</div>`
-    : '<div class="empty">No playlists yet. Use ＋ next to “Your library” or on any song.</div>');
-
-  const rows = recent.slice(0, 30).map((h) => entryRow(h, "recent", { hash: h.hash || h.id, libraryId: null }));
-  setHTML($("v-recent"), rows.length ? rowsHtml(rows) : '<div class="empty">Songs you play show up here.</div>');
+        <button class="hover-play" data-a="pl-play" data-pl="${esc(p.id)}" title="Play" aria-label="Play ${esc(p.name)}" ${p.count ? "" : "disabled"}>${icon("play_arrow")}</button></div>`).join("")}</div>`
+    : `<div class="empty">No playlists yet. Describe a vibe above, or use ${icon("add", "inline")} next to “Your library” or on any song.</div>`);
 }
 
-function fillQueue() {
-  const now = S?.now, next = S?.up_next;
-  setHTML($("v-now"), now ? rowsHtml([{ ...trackRow(now, "q-now"), showStatus: now.status !== "ready" }]) : '<div class="empty">Nothing playing. Pick a radio on Home.</div>');
-  setHTML($("v-next"), next ? rowsHtml([{ ...trackRow(next, "q-next"), showStatus: true }]) : '<div class="empty">Nothing queued yet.</div>');
-  const hist = (S?.history || []).slice(0, 50).map((t) => trackRow(t, "q-hist"));
-  setHTML($("v-session"), hist.length ? rowsHtml(hist) : '<div class="empty">No songs played yet this session.</div>');
+function fillHistory() {
+  setHTML($("v-history-meta"), recent.length ? `${recent.length} song${recent.length === 1 ? "" : "s"}` : "");
+  const rows = recent.map((h) => entryRow(h, "recent", { hash: h.hash || h.id, libraryId: null }));
+  setHTML($("v-history"), rows.length ? rowsHtml(rows) : '<div class="empty">Songs you play show up here.</div>');
 }
 
 function fillLiked() {
@@ -591,7 +632,7 @@ function fillLiked() {
   list = [...list].sort(by);
   setHTML($("v-liked"), list.length
     ? rowsHtml(list.map((e) => entryRow(e, "lib")))
-    : `<div class="empty">${library.length ? "No songs match." : "Songs you like (♥) show up here."}</div>`);
+    : `<div class="empty">${library.length ? "No songs match." : `Songs you like (${icon("favorite", "inline")}) show up here.`}</div>`);
 }
 
 function fillPlaylist() {
@@ -613,69 +654,219 @@ function fillPlaylist() {
   const gs = p.genres || [...new Set(songs.map((s) => s.genre))];
   setHTML($("v-pl-hero"), `<div class="hero">${playlistArt("art", p)}<div><div class="kind">PLAYLIST</div><h1>${esc(p.name)}</h1>
     <div class="muted">${count} song${count === 1 ? "" : "s"}${count ? ` · ${fmtLong(secs)}` : ""}${gs.length ? ` · ${gs.map((g) => esc(genreLabel(g))).join(", ")}` : ""}</div></div></div>`);
-  setHTML($("v-pl-actions"), `<button class="big-play" id="pl-big-play" data-a="pl-play" data-pl="${esc(id)}" title="Play" aria-label="Play" ${count ? "" : "disabled"}>▶</button>
-    <button class="pill" data-a="pl-shuffle" data-pl="${esc(id)}" ${count ? "" : "disabled"}>⤨ Shuffle play</button>
+  setHTML($("v-pl-actions"), `<button class="big-play" id="pl-big-play" data-a="pl-play" data-pl="${esc(id)}" title="Play" aria-label="Play" ${count ? "" : "disabled"}>${icon("play_arrow")}</button>
+    <button class="pill" data-a="pl-shuffle" data-pl="${esc(id)}" ${count ? "" : "disabled"}>${icon("shuffle")}Shuffle play</button>
     <button class="pill" data-a="pl-rename" data-pl="${esc(id)}">Rename</button>
     <button class="pill" data-a="pl-delete" data-pl="${esc(id)}">Delete</button>`);
   if (!pl) { setHTML($("v-pl-rows"), '<div class="empty">Loading songs…</div>'); return; }
   setHTML($("v-pl-rows"), songs.length
     ? rowsHtml(songs.map((e, i) => entryRow(e, "pl", { plId: id, index: i, last: i === songs.length - 1 })), "pl")
-    : '<div class="empty">This playlist is empty. Add songs with ＋ on any song.</div>');
+    : `<div class="empty">This playlist is empty. Add songs with ${icon("add", "inline")} on any song.</div>`);
 }
 
-const BACKENDS = {
-  off: "Procedural only. No AI calls; every song comes from the built-in generator.",
-  "claude-cli": "Uses the local `claude` command line tool and its own login. No API key needed here.",
-  "claude-api": "Calls the Anthropic API directly. Needs ANTHROPIC_API_KEY in the server environment.",
-  openai: "Any OpenAI-compatible endpoint (OpenAI, a local server, …) at the base URL below. Uses OPENAI_API_KEY if the endpoint needs one.",
-};
+// ---------- settings view ----------
+// The forms are built from the last loaded `settings` snapshot only. Polling re-runs
+// fillSettings, but setHTML skips identical markup, so typing is never wiped. A card
+// re-renders only when its saved data changes (save, clear) or when forced.
+const BACKENDS = [
+  ["off", "Off"],
+  ["claude-cli", "Claude CLI"],
+  ["claude-api", "Claude API"],
+  ["openai", "OpenAI-compatible"],
+];
+const URL_PRESETS = [
+  ["OpenAI", "https://api.openai.com/v1"],
+  ["Ollama", "http://localhost:11434/v1"],
+  ["OpenRouter", "https://openrouter.ai/api/v1"],
+  ["LM Studio", "http://localhost:1234/v1"],
+  ["Groq", "https://api.groq.com/openai/v1"],
+];
+const AI_ON = "claude-cli claude-api openai";
+const pendingSnap = {}; // card id -> form snapshot to restore after a forced re-render
+
+function cardHead(id, title) {
+  return `<div class="card-head"><h2 id="${id}">${esc(title)}</h2><span class="dirty" role="status" hidden>${icon("edit", "inline")}Unsaved changes</span></div>`;
+}
+
+// `hint` is trusted markup written here, never server data.
+function textField(id, label, value, placeholder, hint, type = "text", extra = "") {
+  return `<div class="field"><label for="${id}">${esc(label)}</label>
+    <input id="${id}" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder || "")}" spellcheck="false" autocomplete="off" autocapitalize="off"${hint ? ` aria-describedby="${id}-hint"` : ""} ${extra}>
+    ${hint ? `<div class="hint" id="${id}-hint">${hint}</div>` : ""}</div>`;
+}
+
+function keyStatus(k) {
+  if (k?.source === "env") return ["From environment", "env"];
+  if (k?.set) return ["Saved", "saved"];
+  return ["Not set", "none"];
+}
+
+// Write-only secret: never prefilled; only sent when typed, or cleared with the Clear button.
+function keyField(id, label, k, scope, field, hint) {
+  const [txt, cls] = keyStatus(k);
+  const ph = cls === "saved" ? "Leave blank to keep the saved key" : cls === "env" ? "Leave blank to use the environment value" : "Paste the key";
+  return `<div class="field"><label for="${id}">${esc(label)}</label>
+    <div class="key-row">
+      <div class="secret"><input id="${id}" type="password" data-secret autocomplete="new-password" spellcheck="false" autocapitalize="off" placeholder="${ph}" aria-describedby="${id}-status${hint ? ` ${id}-hint` : ""}">
+        <button type="button" class="icon-btn" data-a="reveal" data-for="${id}" title="Show" aria-label="Show ${esc(label)}" aria-pressed="false">${icon("visibility")}</button></div>
+      <span class="kpill ${cls}" id="${id}-status">${txt}</span>
+      ${k?.source === "settings" ? `<button type="button" class="pill small" data-a="key-clear" data-scope="${scope}" data-field="${field}" data-label="${esc(label)}">Clear</button>` : ""}
+    </div>
+    ${hint ? `<div class="hint" id="${id}-hint">${hint}</div>` : ""}</div>`;
+}
+
+function switchHtml(id, label, on) {
+  return `<label class="switch" for="${id}"><input type="checkbox" role="switch" id="${id}" ${on ? "checked" : ""}><span class="track" aria-hidden="true"></span><span>${esc(label)}</span></label>`;
+}
+
+function aiCardHtml(ai) {
+  const d = ai.defaults || {};
+  const keys = ai.keys || {};
+  const list = ai.backends?.length ? ai.backends : BACKENDS.map((b) => b[0]);
+  const own = (v, def) => (v && v !== def ? v : ""); // empty = server default
+  const opts = list.map((b) => {
+    const [, title] = BACKENDS.find((x) => x[0] === b) || [b, b];
+    return `<label class="opt" for="ai-b-${esc(b)}"><input type="radio" name="ai-backend" id="ai-b-${esc(b)}" value="${esc(b)}" ${b === ai.backend ? "checked" : ""}>
+      <span class="opt-title">${esc(title)}</span></label>`;
+  }).join("");
+  const presets = URL_PRESETS.map(([n, u]) => `<button type="button" class="chip" data-a="url-preset" data-url="${esc(u)}" title="${esc(u)}">${esc(n)}</button>`).join("");
+  const ratio = Number(ai.ratio) || 0;
+  return `<section class="card settings-card" id="ai-card" aria-labelledby="ai-h">
+    ${cardHead("ai-h", "AI generation")}
+    <fieldset class="backends"><legend class="sr-only">Backend</legend>${opts}</fieldset>
+    <div class="group" data-backends="claude-cli">
+      ${textField("ai-cli-model", "CLI model", own(ai.cli_model, d.cli_model), d.cli_model)}
+    </div>
+    <div class="group" data-backends="claude-api">
+      ${textField("ai-model", "Model", own(ai.model, d.model), d.model)}
+      ${keyField("ai-key-anthropic", "Anthropic API key", keys.anthropic, "ai", "anthropic_api_key")}
+    </div>
+    <div class="group" data-backends="openai">
+      <div class="field"><label for="ai-base-url">Base URL</label>
+        <input id="ai-base-url" type="text" inputmode="url" value="${esc(ai.base_url || "")}" placeholder="${esc(d.base_url || "")}" spellcheck="false" autocomplete="off" autocapitalize="off">
+        <div class="hint presets" role="group" aria-label="Base URL presets">${presets}</div></div>
+      ${textField("ai-openai-model", "Model", own(ai.openai_model, d.openai_model), d.openai_model)}
+      ${keyField("ai-key-openai", "OpenAI API key", keys.openai, "ai", "openai_api_key")}
+    </div>
+    <div class="group" data-backends="${AI_ON}">
+      <div class="field"><label for="ai-ratio">AI share of radio</label>
+        <input id="ai-ratio" type="range" min="0" max="1" step="0.05" value="${ratio}" aria-describedby="ai-ratio-hint">
+        <div class="hint" id="ai-ratio-hint"><b id="ai-ratio-val">${Math.round(ratio * 100)}%</b></div></div>
+      ${textField("ai-timeout", "Timeout (seconds)", ai.timeout ?? "", "20", "", "number", 'min="1" max="120" step="1" inputmode="numeric"')}
+    </div>
+    <div class="actions"><button type="button" class="pill accent" data-a="ai-save">Save</button><button type="button" class="pill" data-a="ai-test" data-test>Test</button></div>
+    <div id="ai-result" class="result" role="status" aria-live="polite"></div>
+  </section>`;
+}
+
+function storageCardHtml(st) {
+  const keys = st.keys || {};
+  return `<section class="card settings-card" id="st-card" aria-labelledby="st-h">
+    ${cardHead("st-h", "Storage (S3)")}
+    ${switchHtml("st-enabled", "Use S3 storage", st.enabled)}
+    <div class="group" data-s3>
+      ${textField("st-bucket", "Bucket", st.bucket || "", "my-bucket")}
+      ${textField("st-prefix", "Prefix", st.prefix || "", "motif/")}
+      ${textField("st-endpoint", "Endpoint URL", st.endpoint || "", "https://…", "", "text", 'inputmode="url"')}
+      ${textField("st-region", "Region", st.region || "", "us-east-1")}
+      ${keyField("st-key-id", "Access key ID", keys.aws_access_key_id, "storage", "aws_access_key_id")}
+      ${keyField("st-key-secret", "Secret access key", keys.aws_secret_access_key, "storage", "aws_secret_access_key")}
+      <div class="field"><span class="flabel">Song audio</span>${switchHtml("st-media", "Store song audio in S3", st.media)}</div>
+      ${textField("st-backup-hours", "Backup every (hours)", st.backup_interval_hours ?? 0, "0", "", "number", 'min="0" step="1" inputmode="decimal"')}
+    </div>
+    <div class="actions"><button type="button" class="pill accent" data-a="st-save">Save</button><button type="button" class="pill" data-a="st-test" data-test>Test connection</button></div>
+    <div id="st-result" class="result" role="status" aria-live="polite"></div>
+  </section>`;
+}
+
+function backupsHtml(st) {
+  if (!st.enabled) return "";
+  let h = `<section class="card" aria-labelledby="bk-h"><div class="card-head"><h2 id="bk-h">Backups</h2></div>
+    <div class="actions"><button type="button" class="pill accent" data-a="backup-now">Back up now</button></div>`;
+  if (!backups) h += '<div class="empty">Loading backups…</div>';
+  else if (backups.error) h += `<div class="empty">Could not list backups: ${esc(backups.error)}</div>`;
+  else if (!backups.backups?.length) h += '<div class="empty">No backups yet.</div>';
+  else h += backups.backups.map((b) => `<div class="backup"><div class="meta"><div>${esc(fmtDate(b.created))}</div><div class="muted">${esc(b.key)} · ${fmtSize(b.size)}</div></div>
+      <button type="button" class="pill small" data-a="restore" data-key="${esc(b.key)}">Restore</button></div>`).join("");
+  return h + "</section>";
+}
 
 function fillSettings() {
-  if (!settings) { setHTML($("v-ai"), '<div class="empty">Loading settings…</div>'); return; }
-  if (settings.error) { setHTML($("v-ai"), `<div class="empty">Could not load settings: ${esc(settings.error)}</div>`); return; }
-  const ai = settings.ai || {};
-  const keys = ai.keys || {};
-  const backendsList = ai.backends || Object.keys(BACKENDS);
-  // Built from the loaded snapshot only, so polling never resets what is being edited.
-  setHTML($("v-ai"), `<section class="card" id="ai-card"><h2>AI generation</h2>
-    <p class="muted">AI picks a short brief (genre, key, tempo, instruments, name); the procedural engine still writes every note.</p>
-    <div class="field"><label for="ai-backend">Backend</label><select id="ai-backend">${backendsList.map((b) => `<option value="${esc(b)}" ${b === ai.backend ? "selected" : ""}>${esc(b)}</option>`).join("")}</select>
-      <div class="hint" id="ai-backend-hint">${esc(BACKENDS[ai.backend] || "")}</div></div>
-    <div class="field"><label for="ai-model">Model</label><input id="ai-model" type="text" value="${esc(ai.model)}" spellcheck="false">
-      <div class="hint">Used by claude-api and openai.</div></div>
-    <div class="field"><label for="ai-cli-model">CLI model</label><input id="ai-cli-model" type="text" value="${esc(ai.cli_model)}" spellcheck="false">
-      <div class="hint">Used by claude-cli.</div></div>
-    <div class="field"><label for="ai-base-url">OpenAI-compatible base URL</label><input id="ai-base-url" type="text" value="${esc(ai.base_url)}" spellcheck="false"></div>
-    <div class="field"><label for="ai-ratio">AI share of radio songs</label><input id="ai-ratio" type="range" min="0" max="1" step="0.05" value="${Number(ai.ratio) || 0}">
-      <div class="hint"><span id="ai-ratio-val">${Math.round((Number(ai.ratio) || 0) * 100)}%</span> of radio songs ask the AI for a brief. Prompts always use AI when a backend is on.</div></div>
-    <div class="field"><label for="ai-timeout">Timeout (seconds)</label><input id="ai-timeout" type="number" min="1" max="300" step="1" value="${esc(ai.timeout)}"></div>
-    <dl class="kv"><dt>Anthropic API key</dt><dd class="${keys.anthropic ? "ok" : "bad"}">${keys.anthropic ? "configured" : "not set"}</dd>
-      <dt>OpenAI API key</dt><dd class="${keys.openai ? "ok" : "bad"}">${keys.openai ? "configured" : "not set"}</dd></dl>
-    <p class="muted">API keys are only read from environment variables on the server (ANTHROPIC_API_KEY, OPENAI_API_KEY). They are never entered or shown here.</p>
-    <div class="actions"><button class="pill accent" data-a="ai-save">Save</button><button class="pill" data-a="ai-test">Test</button></div>
-    <div id="ai-result" class="result"></div></section>`);
+  if (!settings || settings.error) {
+    setHTML($("v-ai"), settings ? `<div class="empty">Could not load settings: ${esc(settings.error)}</div>` : '<div class="empty">Loading settings…</div>');
+    setHTML($("v-storage"), "");
+    setHTML($("v-backups"), "");
+    return;
+  }
+  if (setHTML($("v-ai"), aiCardHtml(settings.ai || {}))) initCard($("ai-card"));
+  if (setHTML($("v-storage"), storageCardHtml(settings.storage || {}))) initCard($("st-card"));
+  setHTML($("v-backups"), backupsHtml(settings.storage || {}));
+}
 
-  const st = settings.storage || {};
-  let storage = `<section class="card"><h2>Storage</h2><dl class="kv">
-    <dt>S3</dt><dd class="${st.s3 ? "ok" : ""}">${st.s3 ? "enabled" : "off (local SQLite only)"}</dd>`;
-  if (st.s3) {
-    storage += `<dt>Bucket</dt><dd>${esc(st.bucket)}</dd><dt>Prefix</dt><dd>${esc(st.prefix)}</dd>
-      <dt>Endpoint</dt><dd>${esc(st.endpoint || "AWS default")}</dd>
-      <dt>Song audio in S3</dt><dd>${st.media ? "on" : "off"}</dd>
-      <dt>Automatic backup</dt><dd>${st.backup_interval_hours ? `every ${esc(st.backup_interval_hours)} h` : "manual only"}</dd>`;
+// ---------- settings form state ----------
+function formValues(card) {
+  const v = {};
+  for (const el of card.querySelectorAll("input, select")) {
+    if (el.hasAttribute("data-secret")) continue;
+    if (el.type === "radio") { if (el.checked) v[el.name] = el.value; } else if (el.type === "checkbox") v[el.id] = el.checked;
+    else v[el.id] = el.value;
   }
-  storage += "</dl>";
-  if (st.s3) {
-    storage += `<div class="actions"><button class="pill accent" data-a="backup-now">Back up now</button></div><h2>Backups</h2>`;
-    if (!backups) storage += '<div class="empty">Loading backups…</div>';
-    else if (backups.error) storage += `<div class="empty">Could not list backups: ${esc(backups.error)}</div>`;
-    else if (!backups.backups?.length) storage += '<div class="empty">No backups yet.</div>';
-    else storage += backups.backups.map((b) => `<div class="backup"><div class="meta"><div>${esc(fmtDate(b.created))}</div><div class="muted">${esc(b.key)} · ${fmtSize(b.size)}</div></div>
-      <button class="pill small" data-a="restore" data-key="${esc(b.key)}">Restore</button></div>`).join("");
-  } else {
-    storage += '<p class="muted">Set S3_BUCKET (and credentials) in the server environment to enable backups and remote song storage.</p>';
+  return JSON.stringify(v);
+}
+const secretsTyped = (card) => [...card.querySelectorAll("[data-secret]")].some((i) => i.value !== "");
+const isDirty = (card) => !!card && (formValues(card) !== card._base || secretsTyped(card));
+const settingsDirty = () => isDirty($("ai-card")) || isDirty($("st-card"));
+
+function snapshotForm(card) {
+  const s = {};
+  for (const el of card.querySelectorAll("input[id], select[id]")) s[el.id] = el.type === "radio" || el.type === "checkbox" ? el.checked : el.value;
+  return s;
+}
+function restoreForm(snap) {
+  for (const [id, v] of Object.entries(snap)) {
+    const el = $(id);
+    if (!el) continue;
+    if (el.type === "radio" || el.type === "checkbox") el.checked = v; else el.value = v;
   }
-  setHTML($("v-storage"), storage + "</section>");
+}
+
+function initCard(card) {
+  card._base = formValues(card);
+  if (pendingSnap[card.id]) { restoreForm(pendingSnap[card.id]); delete pendingSnap[card.id]; }
+  syncCard(card);
+}
+
+// Show the fields for the current (unsaved) selection and the dirty state. Pure DOM, no re-render.
+function syncCard(card) {
+  if (card.id === "ai-card") {
+    const b = card.querySelector('input[name="ai-backend"]:checked')?.value || "off";
+    for (const g of card.querySelectorAll("[data-backends]")) g.hidden = !g.dataset.backends.split(" ").includes(b);
+    for (const o of card.querySelectorAll(".opt")) o.classList.toggle("on", o.querySelector("input").checked);
+    $("ai-ratio-val").textContent = `${Math.round(parseFloat($("ai-ratio").value) * 100)}%`;
+    const url = $("ai-base-url").value.trim().replace(/\/+$/, "");
+    for (const c of card.querySelectorAll("[data-a=url-preset]")) {
+      const on = c.dataset.url === url;
+      c.classList.toggle("on", on);
+      c.setAttribute("aria-pressed", String(on));
+    }
+  } else if (card.id === "st-card") {
+    card.querySelector("[data-s3]").hidden = !$("st-enabled").checked;
+  }
+  const dirty = isDirty(card);
+  card.classList.toggle("is-dirty", dirty);
+  card.querySelector(".dirty").hidden = !dirty;
+  const test = card.querySelector("[data-test]");
+  const off = card.id === "st-card" && !settings?.storage?.enabled;
+  test.disabled = dirty || off;
+  test.title = dirty ? "Save first" : off ? "Turn S3 on and save first" : "";
+}
+
+// Replace the snapshot with a server response and re-render the given card from it.
+function applySettings(r, cardHost) {
+  if (!r || !r.ai) return loadSettings();
+  settings = r;
+  if (cardHost) $(cardHost)._html = null;
+  if (route.name === "settings") renderView();
 }
 
 // ---------- cheap updates (every poll) ----------
@@ -685,13 +876,15 @@ function highlight() {
     r.classList.toggle("playing", !!m && isPlaying(m));
   }
   const mode = S?.mode || {};
-  const radio = mode.playlist || mode.prompt ? null : mode.shuffle ? "*shuffle" : mode.genre;
+  const radio = mode.playlist ? null : mode.shuffle ? "*shuffle" : mode.genre;
   for (const t of document.querySelectorAll("#view .tile[data-genre]")) t.classList.toggle("active", !!S?.now && t.dataset.genre === radio);
   for (const t of document.querySelectorAll("#view .tile[data-plid]")) t.classList.toggle("active", mode.playlist?.id === t.dataset.plid);
   const big = $("pl-big-play");
   if (big) {
     const mine = mode.playlist?.id === route.id && out?.cur && !wantPaused;
-    big.textContent = mine ? "❚❚" : "▶";
+    setIcon(big, mine ? "pause" : "play_arrow");
+    big.title = mine ? "Pause" : "Play";
+    big.setAttribute("aria-label", big.title);
   }
 }
 
@@ -701,7 +894,7 @@ function renderSidebar() {
   setHTML($("sidebar-playlists"), playlists.map((p) => `<a href="#/playlist/${enc(p.id)}" class="lib-item" data-plid="${esc(p.id)}">
       ${playlistArt("lib-art", p)}
       <span class="lib-meta"><span class="lib-name">${esc(p.name)}</span><span class="lib-sub">Playlist · ${p.count} song${p.count === 1 ? "" : "s"}</span></span>
-      <span class="spk" aria-label="Playing">🔊</span></a>`).join(""));
+      <span class="spk" title="Playing" aria-label="Playing">${icon("volume_up")}</span></a>`).join(""));
   for (const a of $("sidebar-playlists").children) {
     a.classList.toggle("playing", a.dataset.plid === playing);
     a.classList.toggle("active", route.name === "playlist" && a.dataset.plid === route.id);
@@ -714,7 +907,6 @@ function trackSub(t) {
     const pos = (t.playlist_pos ?? mode.playlist.position ?? 0) + 1;
     return `Playlist · ${mode.playlist.name} ${pos}/${mode.playlist.count}`;
   }
-  if (mode.prompt && mode.mood) return `Prompt: ${mode.mood}`;
   if (t.tempo == null) return t.genre ? genreLabel(t.genre) : "AI is choosing…";
   return `${genreLabel(t.genre)} · ${Math.round(t.tempo)} bpm · ${t.key} ${scaleLabel(t.scale)}`;
 }
@@ -724,7 +916,7 @@ function statusText(t) {
   if (t.status === "generating") return t.source && t.source !== "procedural" ? `Composing (asking ${t.source})…` : "Composing…";
   if (t.status === "rendering") return "Rendering…";
   if (t.status === "error") return t.error || "Something went wrong";
-  if (!out) return "Press ▶ to listen";
+  if (!out) return "Press play to listen";
   if (out.cur?.id !== t.id && out.pending?.id !== t.id) return "Loading audio…";
   return "";
 }
@@ -746,22 +938,46 @@ function renderPlayer() {
   const st = statusText(now);
   const busy = !!now && (now.status === "generating" || now.status === "rendering" || st === "Loading audio…");
   setStatus(st, now?.status === "error", busy);
-  $("play").textContent = out && out.cur && !wantPaused ? "❚❚" : "▶";
+  const playing = !!(out && out.cur && !wantPaused);
+  setIcon($("play"), playing ? "pause" : "play_arrow");
+  $("play").title = playing ? "Pause (space)" : "Play (space)";
+  $("play").setAttribute("aria-label", playing ? "Pause" : "Play");
   const ready = !!now && now.status === "ready";
   const isLiked = !!now && (libIds.has(now.hash) || libIds.has(now.library_id));
   $("like").classList.toggle("on", isLiked);
-  $("like").textContent = isLiked ? "♥" : "♡";
+  setIcon($("like"), isLiked ? "favorite" : "favorite_border");
+  $("like").title = isLiked ? "Remove from Liked songs (l)" : "Like (l)";
+  $("like").setAttribute("aria-label", isLiked ? "Remove from Liked songs" : "Like");
+  $("like").setAttribute("aria-pressed", String(isLiked));
   $("like").disabled = !ready;
   $("add-now").disabled = !ready;
   $("download").disabled = !ready;
   $("skip").disabled = !now;
   const rep = S?.mode?.repeat || "off";
   const rb = $("repeat");
-  rb.textContent = rep === "one" ? "🔂" : "🔁";
+  setIcon(rb, rep === "one" ? "repeat_one" : "repeat");
   rb.classList.toggle("on", rep !== "off");
   rb.title = REPEAT_TIP[rep];
   rb.setAttribute("aria-label", REPEAT_TIP[rep]);
   $("device").classList.toggle("on", !!sinkId);
+  renderVolume();
+}
+
+function renderVolume() {
+  const muted = volume <= 0;
+  setIcon($("mute"), muted ? "volume_off" : "volume_up");
+  $("mute").title = muted ? "Unmute" : "Mute";
+  $("mute").setAttribute("aria-label", muted ? "Unmute" : "Mute");
+}
+
+let unmuteTo = volume > 0 ? volume : 0.8;
+function setVolume(v) {
+  volume = Math.max(0, Math.min(1, v));
+  if (volume > 0) unmuteTo = volume;
+  store.set("volume", volume);
+  $("volume").value = volume;
+  if (out) out.setVolume(volume);
+  renderVolume();
 }
 
 function currentSection(sections, t) {
@@ -771,17 +987,77 @@ function currentSection(sections, t) {
 }
 
 let marksFor = null;
+// ---------- seeking ----------
+let seekDrag = null; // fraction 0..1 while the pointer is down on the progress bar
+
+function seekFraction(ev) {
+  const r = $("seek").getBoundingClientRect();
+  return Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width));
+}
+
+function seekTo(t) {
+  if (!out?.cur) return;
+  out.seek(Math.max(0, Math.min(t, out.cur.music)));
+  renderProgress(out.position());
+}
+
+function bindSeek() {
+  const bar = $("seek");
+  bar.onpointerdown = (ev) => {
+    if (!out?.cur || ev.button !== 0) return;
+    ev.preventDefault();
+    bar.setPointerCapture(ev.pointerId);
+    bar.classList.add("dragging");
+    seekDrag = seekFraction(ev);
+    renderProgress(out.position());
+  };
+  bar.onpointermove = (ev) => {
+    if (seekDrag === null) return;
+    seekDrag = seekFraction(ev);
+    renderProgress(out.position());
+  };
+  const finish = (ev, apply) => {
+    if (seekDrag === null) return;
+    const f = apply ? seekFraction(ev) : null;
+    seekDrag = null;
+    bar.classList.remove("dragging");
+    if (f !== null) seekTo(f * out.cur.music);
+  };
+  bar.onpointerup = (ev) => finish(ev, true);
+  bar.onpointercancel = (ev) => finish(ev, false);
+  bar.onkeydown = (ev) => {
+    if (!out?.cur) return;
+    const t = out.position().t;
+    const step = { ArrowLeft: -5, ArrowRight: 5, PageDown: -30, PageUp: 30 }[ev.key];
+    if (step !== undefined) seekTo(t + step);
+    else if (ev.key === "Home") seekTo(0);
+    else if (ev.key === "End") seekTo(out.cur.music - 1);
+    else return;
+    ev.preventDefault();
+    ev.stopPropagation();
+  };
+}
+
 function renderProgress(pos) {
   if (!pos) {
     $("song-bar").style.width = "0";
+    $("seek-knob").style.left = "0";
+    $("seek").setAttribute("aria-valuemax", "0");
+    $("seek").setAttribute("aria-valuenow", "0");
     $("section").textContent = "";
     $("t-cur").textContent = "0:00";
     $("t-total").textContent = S?.now?.music_seconds ? fmtTime(S.now.music_seconds) : "0:00";
     if (marksFor !== null) { $("section-marks").innerHTML = ""; marksFor = null; }
     return;
   }
-  const { t, music, track } = pos;
-  $("song-bar").style.width = `${Math.min(100, (100 * t) / music)}%`;
+  const { music, track } = pos;
+  const t = seekDrag !== null ? seekDrag * music : pos.t; // while dragging, show where it will land
+  const pct = `${Math.min(100, (100 * t) / music)}%`;
+  $("song-bar").style.width = pct;
+  $("seek-knob").style.left = pct;
+  $("seek").setAttribute("aria-valuemax", String(Math.round(music)));
+  $("seek").setAttribute("aria-valuenow", String(Math.round(Math.min(t, music))));
+  $("seek").setAttribute("aria-valuetext", `${fmtTime(Math.min(t, music))} of ${fmtTime(music)}`);
   const sec = t < music ? currentSection(track.sections, t) : null;
   $("section").textContent = sec ? sec.kind : t >= music ? "ending" : "";
   $("t-cur").textContent = fmtTime(Math.min(t, music));
@@ -793,25 +1069,6 @@ function renderProgress(pos) {
   }
 }
 
-// ---------- visualiser ----------
-function drawViz() {
-  const c = $("viz");
-  const ctx2d = c.getContext("2d");
-  const w = (c.width = c.clientWidth * devicePixelRatio);
-  const h = (c.height = c.clientHeight * devicePixelRatio);
-  ctx2d.clearRect(0, 0, w, h);
-  if (out && out.analyser && out.cur) {
-    const data = new Uint8Array(out.analyser.frequencyBinCount);
-    out.analyser.getByteFrequencyData(data);
-    const n = data.length, bw = w / n;
-    ctx2d.fillStyle = "#7ee0b5";
-    for (let i = 0; i < n; i++) {
-      const v = (data[i] / 255) * h * 0.9;
-      ctx2d.fillRect(i * bw, h - v, bw - 1, v);
-    }
-  }
-  requestAnimationFrame(drawViz);
-}
 
 // ---------- menu & dialog ----------
 let menuAnchor = null;
@@ -828,8 +1085,12 @@ function openMenu(anchor, items) {
       el = document.createElement("button");
       el.type = "button";
       el.setAttribute("role", "menuitem");
-      el.textContent = it.label;
-      if (it.checked) el.classList.add("checked");
+      if (it.checked) {
+        el.classList.add("checked");
+        el.innerHTML = icon("check", "chk") + esc(it.label);
+      } else {
+        el.textContent = it.label;
+      }
       if (it.danger) el.style.color = "var(--danger)";
       el.disabled = !!it.disabled;
       el.onclick = (ev) => { ev.stopPropagation(); closeMenu(); it.run?.(); };
@@ -934,7 +1195,7 @@ async function toggleLike(m) {
   if (!sid) {
     return mutate(() => api("/like", { id: m.id }), (r) => (r.already ? "Already in Liked songs" : `Saved “${r.entry?.name ?? m.name}”`));
   }
-  const yes = await ask({ title: "Remove from Liked songs?", text: `“${m.name}” will also be removed from every playlist.`, ok: "Remove", danger: true });
+  const yes = await ask({ title: "Remove from Liked songs?", text: `“${m.name}” will no longer be in Liked songs. Playlists that have it keep it.`, ok: "Remove", danger: true });
   if (yes) mutate(() => api(`/library/${enc(sid)}`, undefined, "DELETE"), "Removed from Liked songs");
 }
 
@@ -978,9 +1239,26 @@ function moreMenu(anchor, m) {
   if (m.ctx === "pl") items.push({ sep: true }, { label: "Remove from playlist", run: () => removeFromPlaylist(m) });
   if (sid) {
     if (m.ctx !== "pl") items.push({ sep: true });
-    items.push({ label: "Remove from library…", danger: true, run: () => toggleLike(m) });
+    items.push({ label: "Remove from Liked songs…", danger: true, run: () => toggleLike(m) });
   }
+  items.push({ sep: true }, { label: "Delete song…", danger: true, run: () => deleteSong(m), disabled: !ready });
   openMenu(anchor, items);
+}
+
+// Removes the song everywhere: saved seed/spec, playlist entries, history, cached audio.
+async function deleteSong(m) {
+  const yes = await ask({
+    title: "Delete song?",
+    text: `“${m.name}” will be removed from Liked songs, every playlist and your history. This can't be undone.`,
+    ok: "Delete", danger: true,
+  });
+  if (!yes) return;
+  const r = await mutate(() => api(`/songs/${enc(m.hash || m.id)}`, undefined, "DELETE"), "Song deleted");
+  if (!r) return;
+  plDetail.clear();
+  if (route.name === "playlist") loadPlaylist(route.id);
+  loadHistory();
+  refresh();
 }
 
 async function renameSong(id, current) {
@@ -1021,7 +1299,7 @@ async function renamePlaylist(id) {
 
 async function deletePlaylist(id) {
   const p = playlists.find((x) => x.id === id);
-  const yes = await ask({ title: "Delete playlist?", text: `“${p?.name ?? "This playlist"}” will be deleted. The songs stay in Liked songs.`, ok: "Delete", danger: true });
+  const yes = await ask({ title: "Delete playlist?", text: `“${p?.name ?? "This playlist"}” will be deleted. Your Liked songs are not affected.`, ok: "Delete", danger: true });
   if (!yes) return;
   const r = await mutate(() => api(`/playlists/${enc(id)}`, undefined, "DELETE"), "Playlist deleted");
   if (r) { plDetail.delete(id); location.hash = "#/home"; }
@@ -1059,46 +1337,89 @@ function filenameFrom(cd) {
   return plain ? plain[1].trim() : "";
 }
 
+// A prompt creates a whole playlist; with an AI backend on this can take 10–50 s.
+let prompting = false;
+function setPromptBusy(busy) {
+  prompting = busy;
+  const btn = $("prompt-btn");
+  $("prompt-form").classList.toggle("busy", busy);
+  $("prompt-form").setAttribute("aria-busy", String(busy));
+  $("prompt").disabled = busy;
+  btn.disabled = busy;
+  btn.innerHTML = busy ? '<span class="spin" aria-hidden="true"></span>Composing your playlist…' : "Create playlist";
+}
+
 async function sendPrompt(text) {
-  if (!text) return;
+  if (!text || prompting) return;
+  setPromptBusy(true);
   wantPaused = false;
   ensureOut();
   try {
     const r = await api("/prompt", { text });
+    const pl = r.playlist;
     S = r;
-    toast(r.genre ? `Playing ${genreLabel(r.genre)} radio for “${text}”` : "AI is choosing…");
+    $("prompt").value = "";
+    if (pl?.songs) plDetail.set(pl.id, pl);
     afterState();
+    await loadLib();
+    if (pl?.id) location.hash = `#/playlist/${enc(pl.id)}`;
+    const n = pl?.count ?? pl?.song_ids?.length ?? 0;
+    toast(pl ? `Created “${pl.name}” · ${n} song${n === 1 ? "" : "s"}` : "Playlist created");
   } catch (e) {
     toast(e.message);
+  } finally {
+    setPromptBusy(false);
   }
 }
 
 // ---------- output devices ----------
+// Browsers hide the speaker list for privacy. Firefox has a proper speaker picker
+// (selectAudioOutput); Chrome only lists speakers once microphone access was granted,
+// so that is the fallback (the stream is stopped at once; nothing is recorded).
+async function listOutputs() {
+  try {
+    return (await navigator.mediaDevices.enumerateDevices())
+      .filter((d) => d.kind === "audiooutput" && d.deviceId && d.deviceId !== "default");
+  } catch {
+    return [];
+  }
+}
+
 async function deviceMenu(anchor) {
   if (!OutClass.sinkSupported() || !navigator.mediaDevices?.enumerateDevices) {
     return openMenu(anchor, [{ heading: "Output device" }, { note: "This browser can't pick an output here. Switch output in system settings." }]);
   }
-  let devs = [];
-  try {
-    devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "audiooutput");
-  } catch { /* none */ }
+  const devs = await listOutputs();
+  const named = devs.filter((d) => d.label);
   const items = [{ heading: "Output device" }];
-  const unnamed = devs.some((d) => !d.label);
   items.push({ label: "System default", checked: !sinkId || sinkId === "default", run: () => pickSink("") });
-  devs.filter((d) => d.deviceId && d.deviceId !== "default").forEach((d, i) => {
-    items.push({ label: d.label || `Output ${i + 1}`, checked: d.deviceId === sinkId, run: () => pickSink(d.deviceId) });
-  });
-  if (unnamed || !devs.length) {
+  named.forEach((d) => items.push({ label: d.label, checked: d.deviceId === sinkId, run: () => pickSink(d.deviceId) }));
+  if (navigator.mediaDevices.selectAudioOutput) {
     items.push({ sep: true }, {
-      label: "Show device names…",
+      label: "Choose speakers…",
       run: async () => {
         try {
-          const s = await navigator.mediaDevices.getUserMedia({ audio: true });
-          s.getTracks().forEach((t) => t.stop());
-        } catch { toast("Permission denied: device names stay hidden"); }
-        deviceMenu(anchor);
+          const d = await navigator.mediaDevices.selectAudioOutput();
+          await pickSink(d.deviceId);
+        } catch { /* picker closed */ }
       },
     });
+  } else if (!named.length) {
+    items.push({ sep: true },
+      { note: "Your browser only lists speakers after microphone access is allowed. Motif never records; the microphone is released immediately." },
+      {
+        label: "Show speakers…",
+        run: async () => {
+          try {
+            const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+            s.getTracks().forEach((t) => t.stop());
+          } catch {
+            return toast("Permission denied: only the system default output is available");
+          }
+          if (!(await listOutputs()).some((d) => d.label)) toast("No other speakers found");
+          deviceMenu(anchor);
+        },
+      });
   }
   openMenu(anchor, items);
 }
@@ -1116,47 +1437,148 @@ async function pickSink(id) {
 }
 
 // ---------- settings actions ----------
-async function saveAI() {
-  const body = {
-    backend: $("ai-backend").value,
-    model: $("ai-model").value.trim(),
-    cli_model: $("ai-cli-model").value.trim(),
-    base_url: $("ai-base-url").value.trim(),
-    ratio: parseFloat($("ai-ratio").value),
-    timeout: parseFloat($("ai-timeout").value),
-  };
+function busyBtn(btn, busy) {
+  if (btn && btn.isConnected) btn.disabled = busy;
+}
+
+function showResult(id, r, okText) {
+  const res = $(id);
+  if (!res) return;
+  const secs = r.seconds != null ? ` in ${Number(r.seconds).toFixed(1)} s` : "";
+  if (r.ok) {
+    res.className = "result ok";
+    res.textContent = `OK${secs}${okText ? ` · ${okText}` : ""}`;
+  } else {
+    res.className = "result bad";
+    res.textContent = `Failed${secs}: ${r.error || "unknown error"}`;
+  }
+}
+
+async function saveAI(btn) {
+  const card = $("ai-card");
+  const backend = card.querySelector('input[name="ai-backend"]:checked')?.value || settings.ai?.backend || "off";
+  const body = { backend, ratio: parseFloat($("ai-ratio").value), timeout: parseFloat($("ai-timeout").value) };
+  if (!(body.timeout >= 1 && body.timeout <= 120)) { toast("Timeout must be between 1 and 120 seconds"); return; }
+  if (backend === "claude-cli") body.cli_model = $("ai-cli-model").value.trim();
+  if (backend === "claude-api") body.model = $("ai-model").value.trim();
+  if (backend === "openai") {
+    body.base_url = $("ai-base-url").value.trim();
+    body.openai_model = $("ai-openai-model").value.trim();
+  }
+  const ak = $("ai-key-anthropic").value.trim(), ok = $("ai-key-openai").value.trim();
+  if (ak) body.anthropic_api_key = ak;
+  if (ok) body.openai_api_key = ok;
+  busyBtn(btn, true);
   try {
     const r = await api("/settings/ai", body, "PUT");
+    applySettings(r, "v-ai");
     toast("AI settings saved");
-    if (r && r.ai) settings = r;
-    else await loadSettings();
-    await loadGenres();
-    renderView();
+    loadGenres();
+  } catch (e) {
+    toast(e.message);
+    busyBtn(btn, false);
+  }
+}
+
+async function testAI(btn) {
+  const res = $("ai-result");
+  res.className = "result muted";
+  res.textContent = "Testing the saved settings…";
+  busyBtn(btn, true);
+  try {
+    const r = await api("/settings/ai/test", {});
+    const b = r.brief || {};
+    const brief = [b.name && `“${b.name}”`, b.genre && genreLabel(b.genre), b.key && `${b.key} ${scaleLabel(b.scale || "")}`.trim(), b.tempo && `${Math.round(b.tempo)} bpm`].filter(Boolean).join(" · ");
+    showResult("ai-result", r, [r.source, brief].filter(Boolean).join(" · "));
+  } catch (e) {
+    res.className = "result bad";
+    res.textContent = e.message;
+  }
+  busyBtn(btn, false);
+  syncCard($("ai-card"));
+}
+
+async function saveStorage(btn) {
+  let body;
+  if (!$("st-enabled").checked) {
+    body = { bucket: "" };
+  } else {
+    const bucket = $("st-bucket").value.trim();
+    if (!bucket) { toast("Enter a bucket name, or turn S3 storage off"); $("st-bucket").focus(); return; }
+    const hours = parseFloat($("st-backup-hours").value || "0");
+    if (!(hours >= 0)) { toast("Backup interval must be 0 or more hours"); return; }
+    body = {
+      bucket, prefix: $("st-prefix").value.trim() || "motif/", endpoint: $("st-endpoint").value.trim(),
+      region: $("st-region").value.trim(), media: $("st-media").checked, backup_interval_hours: hours,
+    };
+    const id = $("st-key-id").value.trim(), secret = $("st-key-secret").value.trim();
+    if (id) body.aws_access_key_id = id;
+    if (secret) body.aws_secret_access_key = secret;
+  }
+  busyBtn(btn, true);
+  try {
+    const r = await api("/settings/storage", body, "PUT");
+    backups = null;
+    applySettings(r, "v-storage");
+    toast(body.bucket ? "Storage settings saved" : "S3 storage turned off");
+    if (settings?.storage?.enabled) loadBackups();
+  } catch (e) {
+    toast(e.message);
+    busyBtn(btn, false);
+  }
+}
+
+async function testStorage(btn) {
+  const res = $("st-result");
+  res.className = "result muted";
+  res.textContent = "Connecting to the saved bucket…";
+  busyBtn(btn, true);
+  try {
+    const r = await api("/settings/storage/test", {});
+    showResult("st-result", r, r.ok ? "bucket reachable" : "");
+  } catch (e) {
+    res.className = "result bad";
+    res.textContent = e.message;
+  }
+  busyBtn(btn, false);
+  syncCard($("st-card"));
+}
+
+function toggleReveal(btn) {
+  const input = $(btn.dataset.for);
+  if (!input) return;
+  const show = input.type === "password";
+  input.type = show ? "text" : "password";
+  setIcon(btn, show ? "visibility_off" : "visibility");
+  btn.title = show ? "Hide" : "Show";
+  btn.setAttribute("aria-pressed", String(show));
+  btn.setAttribute("aria-label", btn.getAttribute("aria-label").replace(/^(Show|Hide)/, show ? "Hide" : "Show"));
+}
+
+async function clearKey(btn) {
+  const { scope, field, label } = btn.dataset;
+  const yes = await ask({
+    title: `Clear the saved ${label}?`,
+    text: "It is removed from this machine. If the matching environment variable is set, that is used instead. Other unsaved changes on this card are kept.",
+    ok: "Clear", danger: true,
+  });
+  if (!yes) return;
+  const host = scope === "ai" ? "v-ai" : "v-storage";
+  const card = scope === "ai" ? $("ai-card") : $("st-card");
+  const snap = snapshotForm(card);
+  try {
+    const r = await api(`/settings/${scope}`, { [field]: "" }, "PUT");
+    pendingSnap[card.id] = snap;
+    applySettings(r, host);
+    toast(`${label} cleared`);
   } catch (e) {
     toast(e.message);
   }
 }
 
-async function testAI() {
-  const res = $("ai-result");
-  res.className = "result muted";
-  res.textContent = "Testing… (uses the saved settings)";
-  try {
-    const r = await api("/settings/ai/test", {});
-    const secs = r.seconds != null ? ` in ${Number(r.seconds).toFixed(1)} s` : "";
-    if (r.ok) {
-      const b = r.brief || {};
-      const brief = [b.name, b.genre && genreLabel(b.genre), b.key && `${b.key} ${scaleLabel(b.scale || "")}`.trim(), b.tempo && `${Math.round(b.tempo)} bpm`].filter(Boolean).join(" · ");
-      res.className = "result ok";
-      res.textContent = `OK · ${r.source}${secs}${brief ? ` · ${brief}` : ""}`;
-    } else {
-      res.className = "result bad";
-      res.textContent = `Failed${secs}: ${r.error || "unknown error"}`;
-    }
-  } catch (e) {
-    res.className = "result bad";
-    res.textContent = e.message;
-  }
+function presetURL(btn) {
+  $("ai-base-url").value = btn.dataset.url;
+  syncCard($("ai-card"));
 }
 
 async function backupNow(btn) {
@@ -1201,6 +1623,7 @@ function onClick(ev) {
     case "row-like": toggleLike(m); break;
     case "row-add": toggleMenuFor(el, () => addMenu(el, m)); break;
     case "row-more": toggleMenuFor(el, () => moreMenu(el, m)); break;
+    case "row-delete": deleteSong(m); break;
     case "row-up": moveRow(m, -1); break;
     case "row-down": moveRow(m, 1); break;
     case "radio": act(() => api("/genre", { genre: el.dataset.genre })); break;
@@ -1216,8 +1639,13 @@ function onClick(ev) {
     case "pl-rename": renamePlaylist(el.dataset.pl); break;
     case "pl-delete": deletePlaylist(el.dataset.pl); break;
     case "chip": liked.genre = el.dataset.genre; fillLiked(); highlight(); break;
-    case "ai-save": saveAI(); break;
-    case "ai-test": testAI(); break;
+    case "ai-save": saveAI(el); break;
+    case "ai-test": testAI(el); break;
+    case "st-save": saveStorage(el); break;
+    case "st-test": testStorage(el); break;
+    case "reveal": toggleReveal(el); break;
+    case "key-clear": clearKey(el); break;
+    case "url-preset": presetURL(el); break;
     case "backup-now": backupNow(el); break;
     case "restore": restore(el.dataset.key); break;
   }
@@ -1229,6 +1657,7 @@ function toggleMenuFor(anchor, open) {
 }
 
 function bind() {
+  bindSeek();
   document.addEventListener("click", onClick);
   window.addEventListener("hashchange", onRoute);
   window.addEventListener("resize", closeMenu);
@@ -1257,23 +1686,25 @@ function bind() {
   $("prompt-form").onsubmit = (ev) => {
     ev.preventDefault();
     const text = $("prompt").value.trim();
-    if (text) { sendPrompt(text); $("prompt").blur(); }
+    if (text && !prompting) { $("prompt").blur(); sendPrompt(text); }
   };
   $("volume").value = volume;
-  $("volume").oninput = (e) => {
-    volume = parseFloat(e.target.value);
-    store.set("volume", volume);
-    if (out) out.setVolume(volume);
-  };
+  $("volume").oninput = (e) => setVolume(parseFloat(e.target.value));
+  $("mute").onclick = () => setVolume(volume > 0 ? 0 : unmuteTo);
 
   // Liked view toolbar lives in the skeleton; only its results re-render.
   $("view").addEventListener("input", (ev) => {
     if (ev.target.id === "liked-q") { liked.q = ev.target.value; fillLiked(); highlight(); }
-    if (ev.target.id === "ai-ratio") $("ai-ratio-val").textContent = `${Math.round(parseFloat(ev.target.value) * 100)}%`;
+    const card = ev.target.closest?.(".settings-card");
+    if (card) syncCard(card);
   });
   $("view").addEventListener("change", (ev) => {
     if (ev.target.id === "liked-sort") { liked.sort = ev.target.value; fillLiked(); highlight(); }
-    if (ev.target.id === "ai-backend") $("ai-backend-hint").textContent = BACKENDS[ev.target.value] || "";
+    const card = ev.target.closest?.(".settings-card");
+    if (card) syncCard(card);
+  });
+  window.addEventListener("beforeunload", (ev) => {
+    if (route.name === "settings" && settingsDirty()) { ev.preventDefault(); ev.returnValue = ""; }
   });
   // Tiles are focusable divs: Enter/Space activate them.
   $("view").addEventListener("keydown", (ev) => {
@@ -1299,11 +1730,17 @@ function bind() {
       togglePause();
     } else if (ev.key === "n") $("skip").click();
     else if (ev.key === "l") $("like").click();
-    else if (ev.key === "/") { ev.preventDefault(); $("prompt").focus(); }
+    else if (ev.key === "/") {
+      ev.preventDefault();
+      if (route.name !== "home") location.hash = "#/home";
+      requestAnimationFrame(() => $("prompt").focus());
+    }
   });
 }
 
 async function init() {
+  fillIcons();
+  renderVolume();
   bind();
   route = parseRoute();
   for (const a of document.querySelectorAll("[data-route]")) a.classList.toggle("active", a.dataset.route === route.name);
@@ -1315,7 +1752,6 @@ async function init() {
   setInterval(refresh, 1000);
   setInterval(tick, 100);
   setInterval(loadLib, 15000);
-  requestAnimationFrame(drawViz);
 }
 
 init();

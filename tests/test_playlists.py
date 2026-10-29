@@ -22,7 +22,8 @@ def test_playlist_crud_and_saving(client):
         r = client.post(f"/playlists/{pl['id']}/songs", json={"id": t})
         assert r.status_code == 200
     pl = client.get(f"/playlists/{pl['id']}").json()["playlist"]
-    assert pl["count"] == 3 and len(client.get("/library").json()["library"]) == 3  # no duplicates
+    assert pl["count"] == 3 and len(set(pl["song_ids"])) == 3  # no duplicates
+    assert client.get("/library").json()["library"] == []  # adding to a playlist doesn't like a song
     assert pl["seconds"] > 0 and pl["genres"] == ["chiptune"]
 
     ids = pl["song_ids"]
@@ -39,18 +40,17 @@ def test_playlist_crud_and_saving(client):
     assert [(x["name"], x["count"]) for x in lists] == [("Coast", 2)] and "songs" not in lists[0]
     assert client.delete(f"/playlists/{pl['id']}").status_code == 200
     assert client.get(f"/playlists/{pl['id']}").status_code == 404
-    assert len(client.get("/library").json()["library"]) == 3  # songs stay saved
+    assert client.library.spec(ids[0]) is None  # unliked songs leave with their last playlist
 
 
-def test_removing_a_saved_song_updates_playlists(client):
+def test_renaming_a_saved_song_shows_in_playlists(client):
     (a,) = played_tracks(client, 1)
     pl = client.post("/playlists", json={"name": "One", "song_id": a}).json()["playlist"]
     song_id = pl["song_ids"][0]
     assert client.patch(f"/library/{song_id}", json={"name": "Renamed"}).json()["entry"]["name"] == "Renamed"
     assert client.get(f"/playlists/{pl['id']}").json()["playlist"]["songs"][0]["name"] == "Renamed"
-    assert client.delete(f"/library/{song_id}").status_code == 200
-    assert client.get(f"/playlists/{pl['id']}").json()["playlist"]["count"] == 0
-    assert client.delete(f"/library/{song_id}").status_code == 404
+    assert client.patch("/library/0123456789abcdef", json={"name": "x"}).status_code == 404
+    assert client.delete("/library/0123456789abcdef").status_code == 404
 
 
 def test_play_playlist_in_order_and_wrap(client):

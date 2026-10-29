@@ -1,9 +1,15 @@
-"""Saved songs, playlists, play history and settings in one SQLite database.
+"""Saved songs, playlists, play history and settings in one database.
+
+SQLite by default (library/motif.db); PostgreSQL when MOTIF_DATABASE_URL is set
+(see app/db.py — the SQL here runs unchanged on both).
 
 Songs are stored as their seed + full SongSpec JSON (a couple of KB), never as
 audio: rendering is deterministic, so audio is re-rendered (or fetched from S3
 media) on demand. The spec is kept, not just the seed, because AI briefs and
 future generator changes could otherwise not reproduce a song exactly.
+
+A saved song is either liked (shows in Liked songs) or only kept because a
+playlist uses it; unliking such a song keeps it for its playlists.
 
 Older JSON files (index.json, playlists.json, history.json) are imported once.
 """
@@ -11,8 +17,8 @@ Older JSON files (index.json, playlists.json, history.json) are imported once.
 from __future__ import annotations
 
 import json
+import logging
 import re
-import sqlite3
 import threading
 import time
 import uuid
@@ -22,37 +28,19 @@ from typing import Any, Iterator, Optional
 
 from pydantic import ValidationError
 
-from app import config
+from app import config, db as dbmod
+from app.db import Conn, Database
 from app.schema import SongSpec
+
+log = logging.getLogger(__name__)
 
 HISTORY_MAX = 200
 NAME_MAX = 60
 SONG_ID = re.compile(r"[0-9a-f]{16}")
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS songs (
-    id TEXT PRIMARY KEY, name TEXT NOT NULL, genre TEXT NOT NULL, tempo REAL, key TEXT, scale TEXT,
-    bars INTEGER, music_seconds REAL, duration REAL, source TEXT, seed INTEGER, spec TEXT NOT NULL,
-    liked_at REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS playlists (
-    id TEXT PRIMARY KEY, name TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS playlist_songs (
-    playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
-    song_id TEXT NOT NULL REFERENCES songs(id) ON DELETE CASCADE,
-    pos INTEGER NOT NULL,
-    PRIMARY KEY (playlist_id, song_id)
-);
-CREATE TABLE IF NOT EXISTS history (
-    n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL, hash TEXT, name TEXT, genre TEXT, tempo REAL,
-    key TEXT, scale TEXT, music_seconds REAL, source TEXT, played_at REAL NOT NULL, spec TEXT
-);
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-"""
-TABLES = ("songs", "playlists", "playlist_songs", "history", "settings")
+TABLES = dbmod.REQUIRED_TABLES
 ENTRY_FIELDS = ("id", "name", "genre", "tempo", "key", "scale", "bars", "music_seconds", "duration",
-                "source", "seed", "liked_at")
+                "source", "seed", "liked_at", "liked")
 HISTORY_FIELDS = ("id", "hash", "name", "genre", "tempo", "key", "scale", "music_seconds", "source", "played_at")
 
 
@@ -90,32 +78,49 @@ def _parse_spec(text: str | None) -> Optional[SongSpec]:
 
 
 class Library:
-    def __init__(self, root: Path | None = None, db_path: Path | None = None):
+    def __init__(self, root: Path | None = None, db_path: Path | None = None, database: Database | None = None):
+        """`database` wins; otherwise MOTIF_DATABASE_URL (for the default library) or SQLite at db_path."""
         self.root = Path(root or config.LIBRARY_DIR)
         self.root.mkdir(parents=True, exist_ok=True)
-        self.db_path = Path(db_path or (self.root / "music.db" if root else config.DB_PATH))
+        # SQLite file: used as the database, or as the source of a one-time import into Postgres.
+        self.db_path = Path(db_path or (self.root / "motif.db" if root else config.DB_PATH))
         self.lock = threading.RLock()
-        with self._db() as db:
-            db.executescript(SCHEMA)
+        legacy = self.db_path.with_name("music.db")  # the app was called "music" before it became Motif
+        if self.db_path.name == "motif.db" and not self.db_path.exists() and legacy.exists():
+            legacy.rename(self.db_path)
+        if database is None:
+            url = config.DATABASE_URL if root is None and db_path is None else None
+            database = dbmod.from_url(url, self.db_path)
+        self.db = database
+        self.db.init_schema()
+        if self.db.dialect != "sqlite":
+            self._import_local_sqlite()
         self._import_json()
 
     @contextmanager
-    def _db(self) -> Iterator[sqlite3.Connection]:
-        """One short-lived connection per operation; works across threads and with restores."""
-        conn = sqlite3.connect(self.db_path, timeout=10)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        try:
-            with conn:
-                yield conn
-        finally:
-            conn.close()
+    def _db(self) -> Iterator[Conn]:
+        with self.db.connect() as conn:
+            yield conn
+
+    def _import_local_sqlite(self) -> None:
+        """First start on Postgres: bring over the existing local SQLite library once."""
+        if not self.db_path.exists() or not self.db.is_empty():
+            return
+        local = dbmod.SQLiteDatabase(self.db_path)
+        local.init_schema()
+        if local.is_empty():
+            return
+        self.db.restore_from(self.db_path)
+        self.set_setting("imported_from_sqlite", {"path": str(self.db_path), "at": time.time()})
+        log.info("imported the local SQLite library %s into PostgreSQL", self.db_path)
 
     # --- saved songs ------------------------------------------------------
 
     def entries(self) -> list[dict]:
+        """Liked songs, newest first."""
         with self._db() as db:
-            rows = db.execute(f"SELECT {', '.join(ENTRY_FIELDS)} FROM songs ORDER BY liked_at DESC").fetchall()
+            rows = db.execute(f"SELECT {', '.join(ENTRY_FIELDS)} FROM songs WHERE liked = 1 "
+                              "ORDER BY liked_at DESC").fetchall()
         return [dict(r) for r in rows]
 
     def get(self, song_id: str) -> Optional[dict]:
@@ -123,12 +128,17 @@ class Library:
             row = db.execute(f"SELECT {', '.join(ENTRY_FIELDS)} FROM songs WHERE id = ?", (song_id,)).fetchone()
         return dict(row) if row else None
 
-    def like(self, spec: SongSpec, source: str) -> tuple[dict, bool]:
-        """Save a song (seed + spec). Returns (entry, already_saved)."""
-        entry = {**summary(spec), "source": source, "liked_at": time.time()}
+    def save(self, spec: SongSpec, source: str, liked: bool = False) -> tuple[dict, bool]:
+        """Store a song (seed + spec). Returns (entry, already_there); liking an unliked song marks it."""
+        entry = {**summary(spec), "source": source, "liked_at": time.time(), "liked": int(liked)}
         with self.lock:
             existing = self.get(entry["id"])
             if existing:
+                if liked and not existing["liked"]:
+                    with self._db() as db:
+                        db.execute("UPDATE songs SET liked = 1, liked_at = ? WHERE id = ?",
+                                   (entry["liked_at"], entry["id"]))
+                    return self.get(entry["id"]), False
                 return existing, True
             with self._db() as db:
                 db.execute(
@@ -137,6 +147,20 @@ class Library:
                     (*(entry[f] for f in ENTRY_FIELDS), spec.model_dump_json()),
                 )
         return entry, False
+
+    def like(self, spec: SongSpec, source: str) -> tuple[dict, bool]:
+        """Save and like a song. Returns (entry, already_liked)."""
+        return self.save(spec, source, liked=True)
+
+    def unlike(self, song_id: str) -> None:
+        """Remove from Liked songs; the song is kept only while a playlist uses it."""
+        with self.lock, self._db() as db:
+            if not db.execute("SELECT 1 FROM songs WHERE id = ?", (song_id,)).fetchone():
+                raise LibraryError("unknown song")
+            if db.execute("SELECT 1 FROM playlist_songs WHERE song_id = ?", (song_id,)).fetchone():
+                db.execute("UPDATE songs SET liked = 0 WHERE id = ?", (song_id,))
+            else:
+                db.execute("DELETE FROM songs WHERE id = ?", (song_id,))
 
     def spec(self, song_id: str) -> Optional[SongSpec]:
         if not SONG_ID.fullmatch(song_id):
@@ -153,15 +177,19 @@ class Library:
                 raise LibraryError("unknown song")
         return self.get(song_id)
 
-    def remove_song(self, song_id: str) -> None:
-        """Delete a saved song; foreign keys take it out of every playlist."""
+    def delete_song(self, song_hash: str) -> dict:
+        """Forget a song completely: its seed + spec (and so every playlist entry) and its history.
+
+        Returns what was removed: {"saved": bool, "history": rows}.
+        """
         with self.lock, self._db() as db:
-            if db.execute("DELETE FROM songs WHERE id = ?", (song_id,)).rowcount == 0:
-                raise LibraryError("unknown song")
+            saved = db.execute("DELETE FROM songs WHERE id = ?", (song_hash,)).rowcount > 0
+            history = db.execute("DELETE FROM history WHERE hash = ?", (song_hash,)).rowcount
+        return {"saved": saved, "history": history}
 
     # --- playlists --------------------------------------------------------
 
-    def _playlist_songs(self, db: sqlite3.Connection, pl_id: str) -> list[dict]:
+    def _playlist_songs(self, db: Conn, pl_id: str) -> list[dict]:
         rows = db.execute(
             f"SELECT {', '.join('s.' + f for f in ENTRY_FIELDS)} FROM playlist_songs ps "
             "JOIN songs s ON s.id = ps.song_id WHERE ps.playlist_id = ? ORDER BY ps.pos",
@@ -169,7 +197,7 @@ class Library:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def _expand(self, db: sqlite3.Connection, row: sqlite3.Row, with_songs: bool) -> dict:
+    def _expand(self, db: Conn, row: dict, with_songs: bool) -> dict:
         songs = self._playlist_songs(db, row["id"])
         out = dict(row)
         out.update(count=len(songs), seconds=sum(s["music_seconds"] or 0 for s in songs),
@@ -196,7 +224,7 @@ class Library:
                        (pl_id, name, now, now))
         return self.playlist(pl_id)
 
-    def _touch(self, db: sqlite3.Connection, pl_id: str) -> None:
+    def _touch(self, db: Conn, pl_id: str) -> None:
         if db.execute("UPDATE playlists SET updated = ? WHERE id = ?", (time.time(), pl_id)).rowcount == 0:
             raise LibraryError("unknown playlist")
 
@@ -209,8 +237,11 @@ class Library:
 
     def delete_playlist(self, pl_id: str) -> None:
         with self.lock, self._db() as db:
+            song_ids = [r[0] for r in db.execute("SELECT song_id FROM playlist_songs WHERE playlist_id = ?", (pl_id,))]
             if db.execute("DELETE FROM playlists WHERE id = ?", (pl_id,)).rowcount == 0:
                 raise LibraryError("unknown playlist")
+            for sid in song_ids:
+                self._drop_orphan(db, sid)
 
     def add_to_playlist(self, pl_id: str, song_id: str) -> dict:
         """Append a saved song (no duplicates)."""
@@ -220,7 +251,8 @@ class Library:
                 raise LibraryError("song is not saved")
             pos = db.execute("SELECT COALESCE(MAX(pos), -1) + 1 FROM playlist_songs WHERE playlist_id = ?",
                              (pl_id,)).fetchone()[0]
-            db.execute("INSERT OR IGNORE INTO playlist_songs (playlist_id, song_id, pos) VALUES (?, ?, ?)",
+            db.execute("INSERT INTO playlist_songs (playlist_id, song_id, pos) VALUES (?, ?, ?) "
+                       "ON CONFLICT DO NOTHING",
                        (pl_id, song_id, pos))
         return self.playlist(pl_id)
 
@@ -228,7 +260,14 @@ class Library:
         with self.lock, self._db() as db:
             self._touch(db, pl_id)
             db.execute("DELETE FROM playlist_songs WHERE playlist_id = ? AND song_id = ?", (pl_id, song_id))
+            self._drop_orphan(db, song_id)
         return self.playlist(pl_id)
+
+    @staticmethod
+    def _drop_orphan(db: Conn, song_id: str) -> None:
+        """Forget a song that is neither liked nor in any playlist."""
+        db.execute("DELETE FROM songs WHERE id = ? AND liked = 0 AND NOT EXISTS "
+                   "(SELECT 1 FROM playlist_songs WHERE song_id = ?)", (song_id, song_id))
 
     def reorder_playlist(self, pl_id: str, song_ids: list[str]) -> dict:
         with self.lock, self._db() as db:
@@ -243,7 +282,7 @@ class Library:
 
     # --- history ----------------------------------------------------------
 
-    def _insert_history(self, db: sqlite3.Connection, h: dict, spec_json: str | None) -> None:
+    def _insert_history(self, db: Conn, h: dict, spec_json: str | None) -> None:
         db.execute(
             "INSERT INTO history (id, hash, name, genre, tempo, key, scale, music_seconds, source, played_at, spec) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -254,6 +293,9 @@ class Library:
     def record_history(self, track_id: str, spec: SongSpec, source: str) -> None:
         h = {**summary(spec), "id": track_id, "hash": spec.audio_hash(), "source": source, "played_at": time.time()}
         with self.lock, self._db() as db:
+            last = db.execute("SELECT hash FROM history ORDER BY n DESC LIMIT 1").fetchone()
+            if last and last["hash"] == h["hash"]:
+                return  # the same song again (re-cued on start, repeat one): one history entry is enough
             self._insert_history(db, h, spec.model_dump_json())
             db.execute("DELETE FROM history WHERE n NOT IN (SELECT n FROM history ORDER BY n DESC LIMIT ?)",
                        (HISTORY_MAX,))

@@ -76,6 +76,13 @@ class Engine(ABC):
     def render_wav(self, spec: SongSpec) -> Path:
         """Render exactly spec.duration_seconds (music + ring-out) to self.wav_path(spec)."""
 
+    def forget(self, spec_hash: str) -> None:
+        """Remove a song's cached audio, locally and from the media store."""
+        for ext in ("mp3", "wav"):
+            (self.cache_dir / f"{self.name}-{spec_hash}.{ext}").unlink(missing_ok=True)
+            if self.media.remote:
+                self.media.delete(f"{spec_hash}.{ext}")
+
     def prune(self, keep: set[str], max_songs: int = config.CACHE_MAX_SONGS) -> None:
         """Drop least-recently-used renders beyond max_songs, never touching hashes in `keep`."""
         mp3s = sorted(self.cache_dir.glob(f"{self.name}-*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)

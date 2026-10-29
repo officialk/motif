@@ -5,9 +5,9 @@
 # (no `claude` binary). Use claude-api (ANTHROPIC_API_KEY) or openai
 # (OPENAI_BASE_URL + OPENAI_API_KEY) in .env.
 services:
-  music:
+  motif:
     build: .
-    image: music:local
+    image: motif:local
     ports:
       - "127.0.0.1:8000:8000"
     env_file:
@@ -15,13 +15,13 @@ services:
         required: false
     volumes:
       - ./soundfonts:/soundfonts:ro
-      - music-data:/data
+      - motif-data:/data
     restart: unless-stopped
 
   # Optional local S3 for media and DB backups:
   #   docker compose --profile minio up --build
   # Create the bucket once in the console at http://127.0.0.1:9001, then in .env:
-  #   S3_BUCKET=music
+  #   S3_BUCKET=motif
   #   S3_ENDPOINT_URL=http://minio:9000
   #   AWS_ACCESS_KEY_ID=<MINIO_ROOT_USER>
   #   AWS_SECRET_ACCESS_KEY=<MINIO_ROOT_PASSWORD>
@@ -32,7 +32,7 @@ services:
     profiles: ["minio"]
     command: server /minio-data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-musicadmin}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-motifadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-please}
     ports:
       - "127.0.0.1:9000:9000"
@@ -41,6 +41,25 @@ services:
       - minio-data:/minio-data
     restart: unless-stopped
 
+  # Optional PostgreSQL instead of SQLite:
+  #   docker compose --profile postgres up --build
+  # then in .env:
+  #   MOTIF_DATABASE_URL=postgresql://motif:motif@postgres:5432/motif
+  # Change POSTGRES_PASSWORD (and the URL) for anything beyond local testing.
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: motif
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-motif}
+      POSTGRES_DB: motif
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
 volumes:
-  music-data:
+  motif-data:
   minio-data:
+  postgres-data:

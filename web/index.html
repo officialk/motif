@@ -3,25 +3,25 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>music</title>
+  <title>Motif</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div class="app">
     <aside class="sidebar">
-      <div class="brand"><span class="logo" aria-hidden="true"></span>music<span id="engine-badge" class="badge"></span></div>
+      <div class="brand"><span class="logo" aria-hidden="true"></span>Motif<span id="engine-badge" class="badge"></span></div>
       <nav class="nav">
-        <a href="#/home" data-route="home"><span class="ico">⌂</span>Home</a>
-        <a href="#/queue" data-route="queue"><span class="ico">≡</span>Queue</a>
-        <a href="#/settings" data-route="settings"><span class="ico">⚙</span>Settings</a>
+        <a href="#/home" data-route="home"><span class="ico" data-icon="home"></span>Home</a>
+        <a href="#/history" data-route="history"><span class="ico" data-icon="history"></span>Recently played</a>
+        <a href="#/settings" data-route="settings"><span class="ico" data-icon="settings"></span>Settings</a>
       </nav>
       <div class="lib-head">
         <span>Your library</span>
-        <button id="new-playlist" class="icon-btn" title="New playlist" aria-label="New playlist">＋</button>
+        <button id="new-playlist" class="icon-btn" title="New playlist" aria-label="New playlist" data-icon="add"></button>
       </div>
       <div class="lib-list">
         <a href="#/liked" data-route="liked" class="lib-item">
-          <span class="lib-art liked-art">♥</span>
+          <span class="lib-art liked-art" data-icon="favorite"></span>
           <span class="lib-meta"><span class="lib-name">Liked songs</span><span id="liked-count" class="lib-sub"></span></span>
         </a>
         <div id="sidebar-playlists" class="sidebar-playlists"></div>
@@ -30,9 +30,9 @@
 
     <main class="main" id="main">
       <form id="prompt-form" class="prompt-bar" autocomplete="off">
-        <span class="prompt-ico" aria-hidden="true">✦</span>
-        <input id="prompt" maxlength="200" placeholder="Ask for music… e.g. “rainy jazz with a tenor sax at 3am”" aria-label="Describe the music you want  (shortcut: /)">
-        <button class="pill accent" type="submit">Generate</button>
+        <span class="prompt-ico" aria-hidden="true" data-icon="auto_awesome"></span>
+        <input id="prompt" maxlength="200" placeholder="Describe a vibe — get a playlist… e.g. rainy jazz with a tenor sax" aria-label="Describe a vibe to create a playlist (shortcut: /)">
+        <button id="prompt-btn" class="pill accent" type="submit">Create playlist</button>
       </form>
       <div id="view" class="view"></div>
     </main>
@@ -45,31 +45,33 @@
         <div id="np-name" class="np-name">Nothing playing</div>
         <div id="np-sub" class="np-sub">Pick a radio or a playlist</div>
       </div>
-      <button id="like" class="icon-btn" title="Like (l)" aria-label="Like">♡</button>
-      <button id="add-now" class="icon-btn" title="Add to playlist" aria-label="Add to playlist">＋</button>
+      <button id="like" class="icon-btn" title="Like (l)" aria-label="Like" aria-pressed="false" data-icon="favorite_border"></button>
+      <button id="add-now" class="icon-btn" title="Add to playlist" aria-label="Add to playlist" data-icon="add"></button>
     </div>
     <div class="transport">
       <div class="buttons">
-        <button id="repeat" class="icon-btn repeat" title="Repeat: off" aria-label="Repeat: off">🔁</button>
-        <button id="play" class="play-btn" title="Play / pause (space)" aria-label="Play or pause">▶</button>
-        <button id="skip" class="icon-btn big" title="Next (n)" aria-label="Next">⏭</button>
+        <button id="repeat" class="icon-btn repeat" title="Repeat: off" aria-label="Repeat: off" data-icon="repeat"></button>
+        <button id="play" class="play-btn" title="Play (space)" aria-label="Play" data-icon="play_arrow"></button>
+        <button id="skip" class="icon-btn big" title="Next (n)" aria-label="Next" data-icon="skip_next"></button>
       </div>
       <div class="timeline">
         <span id="t-cur" class="t">0:00</span>
-        <div class="progress"><div id="song-bar"></div><div id="section-marks"></div></div>
+        <div id="seek" class="seek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
+          <div class="progress"><div id="song-bar"></div><div id="section-marks"></div></div><div id="seek-knob"></div>
+        </div>
         <span id="t-total" class="t">0:00</span>
       </div>
       <div class="np-line"><span id="section" class="section-label"></span><span id="np-status" class="np-status"></span></div>
     </div>
     <div class="right">
-      <button id="download" class="icon-btn" title="Download" aria-label="Download">⤓</button>
-      <a href="#/queue" class="icon-btn" title="Queue" aria-label="Queue">≡</a>
-      <button id="device" class="icon-btn" title="Output device" aria-label="Output device">🔈</button>
+      <button id="download" class="icon-btn" title="Download" aria-label="Download" data-icon="download"></button>
+      <a href="#/history" class="icon-btn" title="Recently played" aria-label="Recently played" data-icon="history"></a>
+      <button id="device" class="icon-btn" title="Output device" aria-label="Output device" data-icon="speaker"></button>
+      <button id="mute" class="icon-btn" title="Mute" aria-label="Mute" data-icon="volume_up"></button>
       <input id="volume" type="range" min="0" max="1" step="0.01" value="0.8" aria-label="Volume">
     </div>
   </footer>
 
-  <canvas id="viz" aria-hidden="true"></canvas>
   <div id="menu" class="menu" role="menu" hidden></div>
   <dialog id="dialog">
     <form method="dialog" class="dialog-body">
@@ -83,6 +85,7 @@
     </form>
   </dialog>
   <div id="toast" role="status"></div>
+  <script src="icons.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

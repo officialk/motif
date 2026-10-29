@@ -72,7 +72,7 @@ def test_requested_genre_wins_and_values_clamped(fake_backend):
 ])
 def test_bad_reply_falls_back_to_procedural(fake_backend, caplog, reply):
     fake_backend(reply=reply)
-    with caplog.at_level(logging.WARNING, logger="music.ai"):
+    with caplog.at_level(logging.WARNING, logger="motif.ai"):
         spec, source = make_spec("jazz", "x", True)
     assert source == "procedural" and spec.genre == "jazz"
     assert "falling back to procedural" in caplog.text
@@ -190,7 +190,7 @@ def test_claude_api_backend(monkeypatch):
     spec, source = make_spec("chiptune", None, True)
     assert source == "claude"
     assert seen["model"] == config.CLAUDE_MODEL and seen["timeout"] == 7 and seen["max_retries"] == 0
-    assert seen["system"] == ai.SYSTEM and seen["max_tokens"] == 1000
+    assert seen["system"] == ai.SYSTEM and seen["max_tokens"] == 3000  # room for a playlist of briefs
 
 
 def test_claude_api_refusal_falls_back(monkeypatch):
@@ -223,7 +223,7 @@ def test_openai_backend_request_shape(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "dummy-test-value")
     monkeypatch.setattr(config, "OPENAI_JSON_MODE", True)
     http = FakeHTTP(monkeypatch)
-    s = settings("openai", base_url="http://localhost:11434/v1/", model="llama3", timeout=9)
+    s = settings("openai", base_url="http://localhost:11434/v1/", openai_model="llama3", timeout=9)
     brief, source = ai.generate_brief("jazz", "smoky", s)
     assert source == "openai" and brief.name == "AI Test Tune"
     c = http.calls[0]
@@ -277,10 +277,10 @@ def test_public_never_exposes_key_values(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "super-secret-dummy")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     pub = settings("openai").public()
-    assert pub["keys"] == {"anthropic": False, "openai": True}
+    assert pub["keys"] == {"anthropic": {"set": False, "source": None}, "openai": {"set": True, "source": "env"}}
     assert "super-secret-dummy" not in json.dumps(pub)
     assert pub["backends"] == ["off", "claude-cli", "claude-api", "openai"]
-    assert pub["model"] == config.OPENAI_MODEL
+    assert pub["openai_model"] == config.OPENAI_MODEL and pub["model"] == config.CLAUDE_MODEL
 
 
 def test_get_set_settings():
@@ -297,3 +297,18 @@ def test_test_backend(fake_backend):
     r = ai.test_backend()
     assert not r["ok"] and r["error"] == "nope"
     assert not ai.test_backend(settings("off"))["ok"]
+
+
+def test_playlist_falls_back_to_procedural_when_ai_fails(monkeypatch):
+    def broken(prompt, settings):
+        raise ai.AIError("down")
+
+    monkeypatch.setitem(ai.BACKENDS, "openai", broken)
+    ai.set_settings(settings("openai"))
+    try:
+        title, songs = ai.make_playlist(None, "slow piano for reading", 5)
+    finally:
+        ai.set_settings(ai.AISettings.from_config())
+    assert title == "Slow piano for reading" and len(songs) == 5
+    assert {s.genre for s, _ in songs} == {"classical-piano"} and {src for _, src in songs} == {"procedural"}
+    assert len({s.audio_hash() for s, _ in songs}) == 5

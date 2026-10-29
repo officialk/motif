@@ -12,6 +12,6 @@ def test_dry_run_prints_spec_without_rendering(capsys, tmp_path, monkeypatch):
 
 
 def test_dry_run_env(capsys, monkeypatch):
-    monkeypatch.setenv("MUSIC_DRY_RUN", "1")
+    monkeypatch.setenv("MOTIF_DRY_RUN", "1")
     assert main(["house"]) == 0
     assert json.loads(capsys.readouterr().out)["spec"]["genre"] == "house"

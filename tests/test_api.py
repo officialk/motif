@@ -45,10 +45,33 @@ def test_bad_input(client):
     assert client.get("/audio/nope.ogg").status_code == 404
 
 
-def test_prompt_station(client):
+def test_prompt_creates_and_plays_a_playlist(client):
     s = client.post("/prompt", json={"text": "smoky jazz with a trumpet"}).json()
-    assert s["genre"] == "jazz" and s["mode"]["prompt"] is True and s["mode"]["mood"] == "smoky jazz with a trumpet"
+    pl = s["playlist"]
+    assert s["genre"] == "jazz" and pl["name"] == "Smoky jazz with a trumpet" and pl["count"] == 8
+    assert len(set(pl["song_ids"])) == 8 and pl["genres"] == ["jazz"]
+    assert s["mode"]["playlist"]["id"] == pl["id"] and s["now"]["library_id"] == pl["song_ids"][0]
+    assert s["up_next"]["library_id"] == pl["song_ids"][1]
     wait_ready(client, s["now"]["id"])
-    assert client.player.get(s["now"]["id"]).spec.instruments.lead == 56
-    assert s["up_next"]["genre"] == "jazz" and s["up_next"]["mood"] == s["mode"]["mood"]
+    assert client.player.get(s["now"]["id"]).spec.instruments.lead == 56  # trumpet from the prompt
+    assert client.get("/library").json()["library"] == []  # generated songs are not "liked"
+    assert client.post("/prompt", json={"text": "chill", "count": 3}).json()["playlist"]["count"] == 3
     assert client.post("/prompt", json={"text": "<<>>"}).status_code == 400
+    assert client.post("/prompt", json={"text": "x", "count": 50}).status_code == 422
+
+
+def test_startup_cues_last_played_or_a_random_radio(client):
+    from app.main import cue_startup_song
+
+    cue_startup_song(client.player, client.library)  # empty history -> random radio
+    s = client.get("/state").json()
+    assert s["now"] is not None and s["mode"]["genre"] in client.get("/genres").json()["genres"]
+    wait_ready(client, s["now"]["id"])
+    first = client.get("/now").json()["now"]
+    client.post("/skip", json={"from_id": first["id"]})  # first song goes to history
+
+    last = client.get("/history").json()["history"][0]["hash"]
+    cue_startup_song(client.player, client.library)  # now: the last played song again
+    again = client.get("/now").json()["now"]
+    assert again["hash"] == last
+    assert again["id"] != first["id"]

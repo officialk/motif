@@ -1,4 +1,4 @@
-# music — local generative radio
+# motif — local generative radio
 
 ## Rules
 

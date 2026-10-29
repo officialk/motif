@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CLAUDE_BACKEND", "off")
 os.environ.setdefault("AI_BACKEND", "off")
-os.environ["MUSIC_ALLOWED_HOSTS"] = "127.0.0.1,localhost,testserver"
+os.environ["MOTIF_ALLOWED_HOSTS"] = "127.0.0.1,localhost,testserver"
 
 from app.engine.fluidsynth_engine import FluidSynthEngine  # noqa: E402
 from app.generator import make_spec, procedural  # noqa: E402
@@ -60,6 +60,15 @@ HARDCODED = {
 @pytest.fixture
 def spec() -> SongSpec:
     return SongSpec.model_validate(HARDCODED)
+
+
+@pytest.fixture(autouse=True)
+def isolated_credentials(tmp_path_factory):
+    """Never touch the real database secrets or master key from tests."""
+    from app import credentials
+
+    credentials.use(credentials.Credentials(tmp_path_factory.mktemp("secrets") / "test-secrets.db"))
+    yield
 
 
 @pytest.fixture

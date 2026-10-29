@@ -16,6 +16,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 Genre = Literal[
     "lofi", "ambient", "synthwave", "jazz", "techno",
     "chiptune", "classical-piano", "house", "trip-hop",
+    "drum-and-bass", "hip-hop", "reggae", "bossa-nova", "funk",
+    "cinematic", "disco", "city-pop", "blues",
 ]
 GENRES: tuple[str, ...] = Genre.__args__  # type: ignore[attr-defined]
 
@@ -45,14 +47,23 @@ GENRE_TEMPO: dict[str, tuple[int, int]] = {
     "classical-piano": (60, 110),
     "house": (118, 128),
     "trip-hop": (70, 96),
+    "drum-and-bass": (160, 176),
+    "hip-hop": (84, 96),
+    "reggae": (68, 90),
+    "bossa-nova": (115, 140),
+    "funk": (96, 116),
+    "cinematic": (60, 100),
+    "disco": (114, 126),
+    "city-pop": (100, 120),
+    "blues": (70, 120),
 }
 
 # GM program numbers (0-indexed) allowed per role. Anything else is rejected.
 ROLE_PROGRAMS: dict[str, frozenset[int]] = {
     "pad": frozenset({48, 49, 50, 51, 52, 53, 54, 88, 89, 90, 91, 92, 93, 94, 95}),
-    "lead": frozenset({0, 4, 5, 8, 9, 11, 12, 24, 26, 56, 65, 66, 71, 73, 80, 81, 82, 84, 87}),
-    "bass": frozenset({32, 33, 34, 35, 36, 37, 38, 39, 80, 81}),
-    "keys": frozenset({0, 1, 2, 4, 5, 8, 11, 16, 17, 18, 24, 25, 26, 46, 80, 81}),
+    "lead": frozenset({0, 4, 5, 8, 9, 11, 12, 22, 24, 26, 40, 56, 60, 61, 65, 66, 68, 71, 73, 80, 81, 82, 84, 87}),
+    "bass": frozenset({32, 33, 34, 35, 36, 37, 38, 39, 43, 80, 81}),
+    "keys": frozenset({0, 1, 2, 4, 5, 7, 8, 11, 16, 17, 18, 24, 25, 26, 27, 46, 48, 61, 80, 81}),
 }
 # Drum kits live on MIDI channel 10 (bank 128); these are the GS kit programs.
 DRUM_KITS: frozenset[int] = frozenset({0, 8, 16, 24, 25, 32, 40, 48})

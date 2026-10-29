@@ -108,18 +108,18 @@ def test_local_media_store_is_noop(tmp_path):
 
 
 def test_media_put_fetch_exists_missing(s3, tmp_path):
-    m = storage.S3MediaStore(s3, "bkt", "music/")
+    m = storage.S3MediaStore(s3, "bkt", "motif/")
     src = tmp_path / "x.mp3"
     src.write_bytes(b"audio-bytes")
     assert m.remote is True
     assert m.exists("x.mp3") is False
     m.put(src, "x.mp3")
-    assert "music/media/x.mp3" in s3.objects
-    assert s3.extra["music/media/x.mp3"]["ContentType"] == "audio/mpeg"
+    assert "motif/media/x.mp3" in s3.objects
+    assert s3.extra["motif/media/x.mp3"]["ContentType"] == "audio/mpeg"
     wav = tmp_path / "x.wav"
     wav.write_bytes(b"w")
     m.put(wav, "x.wav")
-    assert s3.extra["music/media/x.wav"]["ContentType"] == "audio/wav"
+    assert s3.extra["motif/media/x.wav"]["ContentType"] == "audio/wav"
     assert m.exists("x.mp3") is True
 
     dest = tmp_path / "out" / "got.mp3"
@@ -149,10 +149,10 @@ def test_backup_snapshot_while_db_open(s3, tmp_path):
     holder.execute("INSERT INTO songs VALUES ('b', 'two')")
     holder.commit()
     holder.execute("SELECT * FROM songs").fetchall()  # keep connection active
-    store = storage.BackupStore(s3, "bkt", "music/")
+    store = storage.BackupStore(s3, "bkt", "motif/")
     info = store.backup(db)
     holder.close()
-    assert info["key"].startswith("music/backups/music-") and info["key"].endswith(".db")
+    assert info["key"].startswith("motif/backups/motif-") and info["key"].endswith(".db")
     assert info["size"] > 0 and isinstance(info["created"], float)
 
     snap = tmp_path / "snap.db"
@@ -167,14 +167,14 @@ def test_backup_snapshot_while_db_open(s3, tmp_path):
 
 def test_list_newest_first_with_pagination(tmp_path):
     s3 = FakeS3(page_size=2)
-    store = storage.BackupStore(s3, "bkt", "music/")
+    store = storage.BackupStore(s3, "bkt", "motif/")
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     for i in range(5):
-        s3.objects[f"music/backups/music-2026010{i + 1}-000000.db"] = {
+        s3.objects[f"motif/backups/motif-2026010{i + 1}-000000.db"] = {
             "body": b"x" * (i + 1),
             "modified": base + timedelta(days=i),
         }
-    s3.objects["music/media/x.mp3"] = {"body": b"m", "modified": base}
+    s3.objects["motif/media/x.mp3"] = {"body": b"m", "modified": base}
     items = store.list()
     assert [i["key"][-9:-3] for i in items] == ["000000"] * 5
     assert [i["key"] for i in items] == sorted((i["key"] for i in items), reverse=True)
@@ -183,7 +183,7 @@ def test_list_newest_first_with_pagination(tmp_path):
 
 def test_restore_replaces_content_visible_to_open_connection(s3, tmp_path):
     db = make_db(tmp_path / "live.db", "original")
-    store = storage.BackupStore(s3, "bkt", "music/")
+    store = storage.BackupStore(s3, "bkt", "motif/")
     info = store.backup(db)
 
     reader = sqlite3.connect(db)
@@ -201,44 +201,44 @@ def test_restore_replaces_content_visible_to_open_connection(s3, tmp_path):
 
 def test_restore_rejections_leave_live_db_untouched(s3, tmp_path):
     db = make_db(tmp_path / "live.db", "keep")
-    store = storage.BackupStore(s3, "bkt", "music/")
+    store = storage.BackupStore(s3, "bkt", "motif/")
 
-    s3.objects["music/media/x.db"] = {"body": b"x", "modified": datetime.now(timezone.utc)}
+    s3.objects["motif/media/x.db"] = {"body": b"x", "modified": datetime.now(timezone.utc)}
     with pytest.raises(storage.StorageError):
-        store.restore("music/media/x.db", db)
+        store.restore("motif/media/x.db", db)
     with pytest.raises(storage.StorageError):
-        store.restore("other/backups/music-1.db", db)
+        store.restore("other/backups/motif-1.db", db)
     with pytest.raises(storage.StorageError):
-        store.restore("music/backups/../media/x.db", db)
+        store.restore("motif/backups/../media/x.db", db)
 
-    s3.objects["music/backups/music-20260101-000000.db"] = {
+    s3.objects["motif/backups/motif-20260101-000000.db"] = {
         "body": b"this is not sqlite" * 50,
         "modified": datetime.now(timezone.utc),
     }
     with pytest.raises(storage.StorageError, match="SQLite"):
-        store.restore("music/backups/music-20260101-000000.db", db)
+        store.restore("motif/backups/motif-20260101-000000.db", db)
 
     bad = tmp_path / "bad.db"
     c = sqlite3.connect(bad)
     c.execute("CREATE TABLE songs (id TEXT)")
     c.commit()
     c.close()
-    s3.objects["music/backups/music-20260102-000000.db"] = {
+    s3.objects["motif/backups/motif-20260102-000000.db"] = {
         "body": bad.read_bytes(),
         "modified": datetime.now(timezone.utc),
     }
     with pytest.raises(storage.StorageError, match="missing tables"):
-        store.restore("music/backups/music-20260102-000000.db", db)
+        store.restore("motif/backups/motif-20260102-000000.db", db)
 
     with pytest.raises(storage.StorageError, match="not found"):
-        store.restore("music/backups/music-nope.db", db)
+        store.restore("motif/backups/motif-nope.db", db)
 
     assert song_names(db) == ["keep"]
 
 
 def test_scheduler_runs_and_stops(s3, tmp_path):
     db = make_db(tmp_path / "live.db")
-    store = storage.BackupStore(s3, "bkt", "music/")
+    store = storage.BackupStore(s3, "bkt", "motif/")
     sched = storage.BackupScheduler(store, db, 0.00001)  # ~36 ms
     sched.start()
     deadline = time.time() + 5

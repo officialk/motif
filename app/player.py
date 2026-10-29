@@ -1,8 +1,8 @@
 """Server-side radio state: now playing, prefetched next, history, play mode.
 
-Modes: one genre (a "radio"), shuffle (random radio each song), a prompt
-station, or a saved playlist (songs re-rendered from their saved spec, in order
-or shuffled). Repeat: off | all (playlists wrap) | one (the same song again).
+Modes: one genre (a "radio"), shuffle (random radio each song), or a playlist
+(prompts create one; songs are re-rendered from their saved spec, in order or
+shuffled). Repeat: off | all (playlists wrap) | one (the same song again).
 
 The browser does the actual playback; when a song's last bar ends it starts
 the prefetched one and tells the server (POST /skip with the id it was playing) and the server
@@ -25,7 +25,7 @@ from app.engine.base import Engine
 from app.library import Library
 from app.schema import GENRES, SongSpec
 
-log = logging.getLogger("music.player")
+log = logging.getLogger("motif.player")
 
 # (genre, mood, prefer_claude) -> (spec, source)
 # (genre or None = let the AI choose, mood, use_ai) -> (spec, source)
@@ -73,7 +73,6 @@ class Mode:
     genre: Optional[str] = None
     shuffle: bool = False
     mood: Optional[str] = None
-    prompt: bool = False  # mood came from the prompt bar: every song follows it
     repeat: str = "off"
     playlist_id: Optional[str] = None
     playlist_name: Optional[str] = None
@@ -84,8 +83,8 @@ class Mode:
         self.playlist_id, self.playlist_name, self.playlist_shuffle, self.order = None, None, False, []
 
     def public(self, now: "Track | None") -> dict:
-        d = {"genre": self.genre, "shuffle": self.shuffle, "mood": self.mood, "prompt": self.prompt,
-             "repeat": self.repeat, "playlist": None}
+        d = {"genre": self.genre, "shuffle": self.shuffle, "mood": self.mood, "repeat": self.repeat,
+             "playlist": None}
         if self.playlist_id:
             d["playlist"] = {
                 "id": self.playlist_id, "name": self.playlist_name, "shuffle": self.playlist_shuffle,
@@ -125,23 +124,13 @@ class Player:
             raise ValueError(f"unknown genre {genre!r}")
         with self.lock:
             self.mode.leave_playlist()
-            self.mode.genre, self.mode.shuffle, self.mode.mood, self.mode.prompt = genre, False, mood, False
+            self.mode.genre, self.mode.shuffle, self.mode.mood = genre, False, mood
             self._replace_now(self._new_track(genre, mood, prefer_claude=bool(mood)))
-
-    def play_prompt(self, genre: str | None, prompt: str) -> None:
-        """A station built from a free-text prompt: every song uses it (and the AI, when enabled).
-
-        genre None lets the AI pick the radio for the first song; later songs stay in that radio.
-        """
-        with self.lock:
-            self.mode.leave_playlist()
-            self.mode.genre, self.mode.shuffle, self.mode.mood, self.mode.prompt = genre, False, prompt, True
-            self._replace_now(self._new_track(genre, prompt, prefer_claude=True))
 
     def play_random(self, mood: str | None = None) -> None:
         with self.lock:
             self.mode.leave_playlist()
-            self.mode.shuffle, self.mode.mood, self.mode.prompt = True, mood, False
+            self.mode.shuffle, self.mode.mood = True, mood
             genre = self._pick_shuffle_genre()
             self.mode.genre = genre
             self._replace_now(self._new_track(genre, mood, prefer_claude=bool(mood)))
@@ -211,13 +200,21 @@ class Player:
         with self.lock:
             if from_id and (self.now_playing is None or self.now_playing.id != from_id):
                 return False
-            if self.now_playing is None and self.mode.genre is None and not self.mode.prompt:
+            if self.now_playing is None and self.mode.genre is None:
                 return False
             nxt = self.up_next
             if nxt is None or nxt.status == "error":
                 nxt = self._make_next()
             self._replace_now(nxt)
             return True
+
+    def forget(self, spec_hash: str) -> bool:
+        """Drop a deleted song from this session's history. True if it is playing or queued."""
+        with self.lock:
+            kept = [t for t in self.history if not (t.spec and t.spec.audio_hash() == spec_hash)]
+            self.history.clear()
+            self.history.extend(kept)
+            return any(t and t.spec and t.spec.audio_hash() == spec_hash for t in (self.now_playing, self.up_next))
 
     # --- state ------------------------------------------------------------
 
@@ -270,11 +267,7 @@ class Player:
             track = self._new_track(self._next_genre(), None)
             track.leaves_playlist = True
             return track
-        if self.mode.prompt and self.mode.genre is None and now is not None:
-            if now.genre is None:  # the AI is still choosing the radio: let it choose again
-                return self._new_track(None, self.mode.mood, prefer_claude=True)
-            self.mode.genre = now.genre
-        return self._new_track(self._next_genre(), self.mode.mood, prefer_claude=self.mode.prompt)
+        return self._new_track(self._next_genre(), self.mode.mood)
 
     def _again(self, track: Track) -> Track:
         """The same song once more (repeat one); audio comes from the cache."""
@@ -341,10 +334,7 @@ class Player:
             spec, source = self.spec_maker(track.genre, track.mood, use_claude)
             with self.lock:
                 track.spec, track.source, track.status = spec, source, "rendering"
-                if track.genre is None:  # the AI picked the radio
-                    track.genre = spec.genre
-                    if self.mode.prompt and self.mode.genre is None and track in (self.now_playing, self.up_next):
-                        self.mode.genre = spec.genre
+                track.genre = spec.genre
         except Exception as e:  # spec_maker already falls back; this is a last resort
             log.exception("spec generation failed")
             with self.lock:

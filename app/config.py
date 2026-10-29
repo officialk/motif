@@ -10,21 +10,23 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.environ.get("MUSIC_DATA_DIR", ROOT))
-CACHE_DIR = Path(os.environ.get("MUSIC_CACHE_DIR", DATA_DIR / "cache"))
-LIBRARY_DIR = Path(os.environ.get("MUSIC_LIBRARY_DIR", DATA_DIR / "library"))
-DB_PATH = Path(os.environ.get("MUSIC_DB", LIBRARY_DIR / "music.db"))
-SOUNDFONT_DIR = Path(os.environ.get("MUSIC_SOUNDFONT_DIR", ROOT / "soundfonts"))
+DATA_DIR = Path(os.environ.get("MOTIF_DATA_DIR", ROOT))
+CACHE_DIR = Path(os.environ.get("MOTIF_CACHE_DIR", DATA_DIR / "cache"))
+LIBRARY_DIR = Path(os.environ.get("MOTIF_LIBRARY_DIR", DATA_DIR / "library"))
+DB_PATH = Path(os.environ.get("MOTIF_DB", LIBRARY_DIR / "motif.db"))
+# PostgreSQL instead of SQLite, e.g. postgresql://motif:secret@db.example:5432/motif. Unset = SQLite at DB_PATH.
+DATABASE_URL = os.environ.get("MOTIF_DATABASE_URL", "").strip() or None
+SOUNDFONT_DIR = Path(os.environ.get("MOTIF_SOUNDFONT_DIR", ROOT / "soundfonts"))
 WEB_DIR = ROOT / "web"
 
-HOST = os.environ.get("MUSIC_HOST", "127.0.0.1")
-PORT = int(os.environ.get("MUSIC_PORT", "8000"))
+HOST = os.environ.get("MOTIF_HOST", "127.0.0.1")
+PORT = int(os.environ.get("MOTIF_PORT", "8000"))
 # Host names the browser may use to reach the app. Requests with any other Host header
 # (DNS rebinding) or a foreign Origin on POST/PUT/PATCH/DELETE (cross-site requests) are refused.
-ALLOWED_HOSTS = [h.strip() for h in os.environ.get("MUSIC_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",") if h.strip()]
+ALLOWED_HOSTS = [h.strip() for h in os.environ.get("MOTIF_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",") if h.strip()]
 
 SAMPLE_RATE = 44100
-CACHE_MAX_SONGS = int(os.environ.get("MUSIC_CACHE_MAX", "12"))  # ~50 MB each (WAV + MP3)
+CACHE_MAX_SONGS = int(os.environ.get("MOTIF_CACHE_MAX", "12"))  # ~50 MB each (WAV + MP3)
 
 
 def _backend_default() -> str:
@@ -46,7 +48,7 @@ OPENAI_JSON_MODE = os.environ.get("OPENAI_JSON_MODE", "1") != "0"
 
 # S3-compatible storage (AWS S3, MinIO, Cloudflare R2, ...). Empty bucket = local only.
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
-S3_PREFIX = os.environ.get("S3_PREFIX", "music/")
+S3_PREFIX = os.environ.get("S3_PREFIX", "motif/")
 S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL") or None
 S3_REGION = os.environ.get("S3_REGION") or None
 S3_MEDIA = os.environ.get("S3_MEDIA", "1") != "0"  # store saved/exported songs' audio in S3
@@ -54,7 +56,7 @@ S3_BACKUP_INTERVAL_HOURS = float(os.environ.get("S3_BACKUP_INTERVAL_HOURS", "0")
 
 
 def find_soundfont() -> Path:
-    env = os.environ.get("MUSIC_SOUNDFONT")
+    env = os.environ.get("MOTIF_SOUNDFONT")
     if env:
         return Path(env)
     fonts = sorted(SOUNDFONT_DIR.glob("*.sf2"))

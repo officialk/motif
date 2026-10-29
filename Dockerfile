@@ -4,11 +4,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends fluidsynth ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --uid 1000 music \
+RUN useradd --create-home --uid 1000 motif \
     && mkdir -p /data /soundfonts \
-    && chown music:music /data
+    && chown motif:motif /data
 
-WORKDIR /srv/music
+WORKDIR /srv/motif
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -18,12 +18,12 @@ COPY web/ web/
 
 # The soundfont is not baked in (32 MB, licence asks for a link to the author);
 # mount a .sf2 read-only at /soundfonts.
-ENV MUSIC_HOST=0.0.0.0 \
-    MUSIC_DATA_DIR=/data \
-    MUSIC_SOUNDFONT_DIR=/soundfonts \
+ENV MOTIF_HOST=0.0.0.0 \
+    MOTIF_DATA_DIR=/data \
+    MOTIF_SOUNDFONT_DIR=/soundfonts \
     PYTHONUNBUFFERED=1
 
-USER music
+USER motif
 VOLUME /data
 EXPOSE 8000
 
