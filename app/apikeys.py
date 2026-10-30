@@ -1,9 +1,13 @@
 """API keys for tools and the overlay (Streamer.bot, scripts, OBS).
 
-A key is a random `mk_…` token shown once on creation; only its SHA-256 is
-stored (the token has 256 bits of entropy, so a fast hash is fine). Each key has
-scopes that decide which requests it may make; settings, admin and library edits
-are never reachable with a key.
+Two kinds of key, each a random token shown once on creation (only its SHA-256 is
+stored; the token has 256 bits of entropy, so a fast hash is fine):
+
+- API keys (`mk_…`) for tools and bots, with read / control / request scopes.
+- Overlay keys (`mo_…`) for overlay pages: they play the audio and show what's
+  playing (the `speaker` scope) and nothing else. Only overlay keys open an overlay.
+
+Settings, admin and library edits are never reachable with a key.
 """
 
 from __future__ import annotations
@@ -20,7 +24,8 @@ from typing import Optional
 from app.db import Database
 
 SCOPES = ("read", "control", "request", "speaker")
-PREFIX = "mk_"
+API_SCOPES = ("read", "control", "request")
+PREFIXES = {"api": "mk_", "overlay": "mo_"}
 LAST_USED_EVERY = 60.0  # seconds between last_used writes per key
 RATE_LIMITS = {"control": (60, 60.0), "skip": (60, 60.0), "request": (6, 60.0)}  # scope -> (requests, per seconds)
 
@@ -32,9 +37,9 @@ _RULES: list[tuple[str, re.Pattern, str]] = [
         ("GET", r"/events", "read"),
         ("GET", r"/audio/[^/]+\.mp3", "read"),
         ("POST", r"/skip", "skip"),
-        ("POST", r"/(repeat|genre|random|play|like|control|speaker/assign)", "control"),
-        ("POST", r"/playlists/[^/]+/play", "control"),
-        ("POST", r"/prompt", "request"),
+        ("POST", r"/(repeat|genre|random|play|previous|queue/jump|like|control|speaker/assign)", "control"),
+        ("POST", r"/playlists/[^/]+/(play|shuffle)", "control"),
+        ("POST", r"/(prompt|playlists/[^/]+/generate)", "request"),
         ("POST", r"/(speaker/claim|playback)", "speaker"),
     )
 ]
@@ -62,6 +67,8 @@ def _hash(token: str) -> str:
 class ApiKeys:
     def __init__(self, db: Database):
         self.db = db
+        with self.db.connect() as conn:  # keys made before key kinds existed: speaker keys are overlays
+            conn.execute("UPDATE api_keys SET kind = 'overlay' WHERE kind = 'api' AND scopes LIKE '%speaker%'")
         self._used: dict[str, float] = {}
         self.revoked: set[str] = set()  # ids revoked while this server runs: open streams close at once
         self._hits: dict[tuple[str, str], deque] = {}
@@ -70,21 +77,27 @@ class ApiKeys:
     @staticmethod
     def _public(row) -> dict:
         return {"id": row["id"], "name": row["name"], "scopes": row["scopes"].split(","),
-                "prefix": row["prefix"], "created": row["created"], "last_used": row["last_used"]}
+                "kind": row["kind"], "prefix": row["prefix"], "created": row["created"],
+                "last_used": row["last_used"]}
 
-    def create(self, name: str, scopes: list[str]) -> tuple[dict, str]:
+    def create(self, name: str, scopes: list[str], kind: str = "api") -> tuple[dict, str]:
         name = " ".join(str(name).split())[:60]
-        scopes = sorted(set(scopes), key=SCOPES.index) if all(s in SCOPES for s in scopes) else None
         if not name:
             raise ValueError("name can't be empty")
-        if not scopes:
-            raise ValueError(f"choose at least one scope of {', '.join(SCOPES)}")
-        token = PREFIX + secrets.token_urlsafe(32)
+        if kind == "overlay":
+            scopes = ["speaker"]  # plays the audio, reads what's playing, advances at song end
+        elif kind == "api":
+            if not all(s in API_SCOPES for s in scopes) or not scopes:
+                raise ValueError(f"choose at least one scope of {', '.join(API_SCOPES)}")
+            scopes = sorted(set(scopes), key=SCOPES.index)
+        else:
+            raise ValueError("kind must be api or overlay")
+        token = PREFIXES[kind] + secrets.token_urlsafe(32)
         row = {"id": uuid.uuid4().hex[:10], "name": name, "hash": _hash(token), "scopes": ",".join(scopes),
-               "prefix": token[:7], "created": time.time(), "last_used": None}
+               "prefix": token[:7], "created": time.time(), "last_used": None, "kind": kind}
         with self.db.connect() as db:
-            db.execute("INSERT INTO api_keys (id, name, hash, scopes, prefix, created, last_used) "
-                       "VALUES (?, ?, ?, ?, ?, ?, ?)", tuple(row.values()))
+            db.execute("INSERT INTO api_keys (id, name, hash, scopes, prefix, created, last_used, kind) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", tuple(row.values()))
         return self._public(row), token
 
     def list(self) -> list[dict]:
@@ -107,7 +120,7 @@ class ApiKeys:
             return db.execute("SELECT 1 FROM api_keys WHERE id = ?", (key_id,)).fetchone() is not None
 
     def verify(self, token: str) -> Optional[dict]:
-        if not token.startswith(PREFIX) or len(token) > 100:
+        if not token.startswith(tuple(PREFIXES.values())) or len(token) > 100:
             return None
         with self.db.connect() as db:
             row = db.execute("SELECT * FROM api_keys WHERE hash = ?", (_hash(token),)).fetchone()

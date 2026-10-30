@@ -35,17 +35,24 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from app import apikeys, config, credentials, storage
 from app.engine.fluidsynth_engine import FluidSynthEngine
 from app.generator import ai, clean_mood, make_spec, procedural
-from app.library import Library, LibraryError, safe_filename
+from app.library import LIKED_ID, Library, LibraryError, safe_filename
 from app.player import Player
-from app.schema import GENRES, SongSpec
+from app.schema import GENRE_TEMPO, GENRES, Genre, SongSpec
 
 log = logging.getLogger("motif")
 SONG_HASH = re.compile(r"[0-9a-f]{16}")
 
 
 class GenreBody(BaseModel):
-    genre: str
+    genre: Genre = Field(description="A genre id from GET /genres")
     mood: Optional[str] = Field(default=None, max_length=2000)
+
+
+class GenerateBody(BaseModel):
+    genre: Optional[Genre] = Field(default=None, description="Radio for the new songs; null = AI or prompt picks")
+    prompt: Optional[str] = Field(default=None, max_length=200,
+                                  description="Feel of the new songs (default: the prompt the playlist was made from)")
+    count: int = Field(default=1, ge=1, le=10)
 
 
 class PromptBody(BaseModel):
@@ -84,6 +91,7 @@ class RandomBody(BaseModel):
 
 class SkipBody(BaseModel):
     from_id: Optional[str] = None
+    manual: bool = Field(default=False, description="Next was pressed (vs. the song ended)")
 
 
 class RepeatBody(BaseModel):
@@ -111,9 +119,19 @@ class OrderBody(BaseModel):
     song_ids: list[str] = Field(max_length=2000)
 
 
+class JumpBody(BaseModel):
+    pos: int = Field(ge=0)
+
+
+class ShuffleBody(BaseModel):
+    mode: Literal["off", "on", "auto"] = Field(description="auto = Shuffle+: new songs are mixed in")
+
+
 class PlayPlaylistBody(BaseModel):
     start: Optional[str] = Field(default=None, max_length=64)
     shuffle: bool = False
+    plus: bool = Field(default=False, description="Shuffle+: shuffle and mix in newly generated songs, "
+                                                  "making more whenever the playlist runs out")
 
 
 class AISettingsBody(BaseModel):
@@ -166,11 +184,44 @@ class ControlBody(BaseModel):
 
 class NewKeyBody(BaseModel):
     name: str = Field(max_length=200)
-    scopes: list[str] = Field(max_length=8)
+    kind: Literal["api", "overlay"] = "api"
+    scopes: list[str] = Field(default_factory=list, max_length=8, description="API keys only")
 
 
 class RestoreBody(BaseModel):
     key: str = Field(max_length=500)
+
+
+API_TAGS = [
+    {"name": "player", "description": "What plays, and controlling it. Answers are the player state."},
+    {"name": "queue", "description": "The play list around the current song."},
+    {"name": "live", "description": "Server-Sent Events and the speaker (the one client that plays audio)."},
+    {"name": "library", "description": "Liked songs, play history and downloads."},
+    {"name": "playlists", "description": "Playlists, including AI playlists made from a prompt."},
+    {"name": "settings", "description": "App, AI and storage settings (the app's own page only)."},
+    {"name": "keys", "description": "Overlay and API keys (the app's own page only)."},
+    {"name": "admin", "description": "Database backups (the app's own page only)."},
+]
+_TAG_RULES = [  # first match wins
+    (r"/(state|genres|genre|random|skip|previous|play|repeat|prompt|audio/.*)", "player"),
+    (r"/queue(/.*)?", "queue"),
+    (r"/(events|speaker/.*|playback|control)", "live"),
+    (r"/(like|library(/.*)?|history|songs/.*|download/.*)", "library"),
+    (r"/playlists(/.*)?", "playlists"),
+    (r"/settings/keys(/.*)?", "keys"),
+    (r"/settings(/.*)?", "settings"),
+    (r"/admin/.*", "admin"),
+]
+
+
+def _tag_routes(app: FastAPI) -> None:
+    """Group the endpoints in /docs by what they do."""
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        for pattern, tag in _TAG_RULES:
+            if re.fullmatch(pattern, path.replace("{", "").replace("}", "")):
+                route.tags = [tag]
+                break
 
 
 def create_app(player: Player | None = None, library: Library | None = None,
@@ -213,14 +264,27 @@ def create_app(player: Player | None = None, library: Library | None = None,
             scheduler.pop().stop()
         app.state.player.shutdown()
 
-    app = FastAPI(title="motif", lifespan=lifespan)
+    app = FastAPI(title="Motif", lifespan=lifespan, openapi_tags=API_TAGS,
+                  description="Local generative radio. Tools and bots use an API key (`Authorization: Bearer mk_…`) "
+                              "with the scopes they need; see the README.")
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=config.ALLOWED_HOSTS)
+
+    _LIBRARY_EDIT = re.compile(r"/(like|library(/.*)?|songs/.*|admin/restore|playlists(/[^/]+(/songs(/.*)?|/order)?)?)")
+
+    @app.middleware("http")
+    async def library_sync(request: Request, call_next):
+        """Any change to liked songs or playlists tells open pages to reload their library."""
+        response = await call_next(request)
+        if (request.method in ("POST", "PUT", "PATCH", "DELETE") and response.status_code < 400
+                and _LIBRARY_EDIT.fullmatch(request.url.path) and app.state.player is not None):
+            app.state.player.library_touched()
+        return response
 
     @app.middleware("http")
     async def access(request: Request, call_next):
         """API keys for tools/overlays; otherwise the same-origin browser rules.
 
-        With `Authorization: Bearer mk_…` a request is allowed only within the key's scopes
+        With `Authorization: Bearer mk_…` (API key) or `mo_…` (overlay key) a request is allowed only within the key's scopes
         (settings, admin and library edits are never reachable with a key). Without a key,
         other web pages are blocked from changing anything: the API can forward the OpenAI
         key to the configured base URL, so settings must only change from this app's own page.
@@ -289,21 +353,39 @@ def create_app(player: Player | None = None, library: Library | None = None,
 
     @app.get("/genres")
     def genres():
+        """The radios a request can name (e.g. `genre` in POST /genre or /playlists/{id}/generate),
+        with each one's display name and tempo range in bpm."""
         s = ai.get_settings()
-        return {"genres": list(GENRES), "ai": {"backend": s.backend, "model": s.model}}
+        return {"genres": list(GENRES),
+                "details": [{"id": g, "name": g.replace("-", " ").capitalize(), "tempo_bpm": list(GENRE_TEMPO[g])}
+                            for g in GENRES],
+                "ai": {"backend": s.backend, "model": s.model}}
 
     @app.get("/state")
     def state():
-        return p().state()
+        """What plays now and next, and the play mode (radio, playlist, shuffle, repeat).
 
-    @app.get("/now")
-    def now():
-        s = p().state()
-        return {"now": s["now"], "mode": s["mode"]}
+        Every player action below answers with this same state."""
+        return p().state()
 
     @app.get("/queue")
     def queue():
-        return {"up_next": p().state()["up_next"]}
+        """Now playing and what comes next: a playlist's remaining queue (`pos` per song, `repeats`
+        when it loops), or for a radio / Shuffle+ just the next song."""
+        return p().queue()
+
+    @app.post("/queue/jump")
+    def queue_jump(body: JumpBody):
+        """Play the playlist queue from this position."""
+        if not p().jump(body.pos):
+            raise HTTPException(409, "nothing to play at that position")
+        return p().state()
+
+    @app.post("/previous")
+    def previous():
+        """Back one song (the previous one in the queue, or on a radio the last one played)."""
+        moved = p().previous()
+        return {"moved": moved, **p().state()}
 
     @app.get("/history")
     def history(limit: int = Query(default=50, ge=1, le=200)):
@@ -312,8 +394,7 @@ def create_app(player: Player | None = None, library: Library | None = None,
 
     @app.post("/genre")
     def genre(body: GenreBody):
-        if body.genre not in GENRES:
-            raise HTTPException(400, f"unknown genre; choose one of {', '.join(GENRES)}")
+        """Play a genre's radio (optionally steered by a mood)."""
         p().play_genre(body.genre, clean_mood(body.mood))
         return p().state()
 
@@ -331,15 +412,46 @@ def create_app(player: Player | None = None, library: Library | None = None,
         genre = None if use_ai else procedural.genre_from_prompt(text)
         count = body.count or load_app_settings(lib).prompt_count
         title, songs = ai.make_playlist(genre, text, count, use_ai)
-        pl = lib.create_playlist(title)
+        made_by_ai = any(source != "procedural" for _, source in songs)
+        pl = lib.create_playlist(title, source="ai" if made_by_ai else None, prompt=text)
         for spec, source in songs:
             entry, _ = lib.save(spec, source)
             lib.add_to_playlist(pl["id"], entry["id"])
         p().play_playlist(pl["id"])
         return {"playlist": lib.playlist(pl["id"]), "genre": songs[0][0].genre, **p().state()}
 
+    @app.post("/playlists/{pl_id}/generate")
+    def generate_into_playlist(pl_id: str, body: GenerateBody | None = None):
+        """Make new songs and append them to a playlist (with AI on, in the playlist's vibe).
+
+        A fresh random seed is picked for each song; `genre` pins the radio (e.g. a chat request).
+        If the playlist is playing, the new songs join its queue.
+        """
+        body = body or GenerateBody()
+        pl = lib.playlist(pl_id) if pl_id != LIKED_ID else None
+        if pl is None:
+            raise HTTPException(404, "unknown playlist")
+        added = add_generated(pl, body.genre, clean_mood(body.prompt), body.count)
+        return {"added": added, "playlist": lib.playlist(pl_id)}
+
+    def add_generated(pl: dict, genre: Optional[str], prompt: Optional[str], count: int) -> list[dict]:
+        pl_id = pl["id"]
+        text = prompt or pl.get("prompt") or pl["name"]
+        use_ai = ai.get_settings().backend != "off"
+        genre = genre or (None if use_ai else procedural.genre_from_prompt(text))
+        existing = [{"name": s["name"], "genre": s["genre"]} for s in pl["songs"]]
+        _, songs = ai.make_playlist(genre, text, count, use_ai, existing=existing)
+        added = []
+        for spec, source in songs:
+            entry, _ = lib.save(spec, source)
+            lib.add_to_playlist(pl_id, entry["id"])
+            added.append(entry)
+        p().playlist_grew(pl_id, [e["id"] for e in added])
+        return added
+
     @app.post("/random")
     def random_(body: RandomBody | None = None):
+        """Play a random radio that changes genre every song."""
         p().play_random(clean_mood(body.mood) if body else None)
         return p().state()
 
@@ -348,7 +460,7 @@ def create_app(player: Player | None = None, library: Library | None = None,
         key = getattr(request.state, "api_key", None)
         if key and "control" not in key["scopes"] and not (body and body.from_id):
             raise HTTPException(403, "a speaker key can only advance at the end of the playing song (from_id)")
-        moved = p().skip(body.from_id if body else None)
+        moved = p().skip(body.from_id if body else None, manual=body is None or body.manual or not body.from_id)
         return {"skipped": moved, **p().state()}
 
     # --- live sync: SSE, speaker and remote control -----------------------------
@@ -360,6 +472,8 @@ def create_app(player: Player | None = None, library: Library | None = None,
         """Server-Sent Events: a full versioned snapshot now and after every change."""
         player = p()
         key = getattr(request.state, "api_key", None)
+        if kind == "overlay" and key is not None and key.get("kind") != "overlay":
+            raise HTTPException(403, "overlays need an overlay key, not an API key")
         label = " ".join(name.split())[:40] if name else None
         player.connect_client(client, kind, label or None, audio)
 
@@ -419,11 +533,13 @@ def create_app(player: Player | None = None, library: Library | None = None,
 
     @app.post("/repeat")
     def repeat(body: RepeatBody):
+        """Repeat: off, all (a playlist loops) or one (the same song again)."""
         p().set_repeat(body.mode)
         return p().state()
 
     @app.get("/audio/{track_id}.mp3")
     def audio(track_id: str):
+        """The MP3 of a track that is playing or queued (status ready)."""
         t = p().get(track_id)
         if t is None or t.status != "ready":
             raise HTTPException(404, "no such audio (yet)")
@@ -433,7 +549,6 @@ def create_app(player: Player | None = None, library: Library | None = None,
         return FileResponse(path, media_type="audio/mpeg")
 
     @app.post("/download/{song_id}")
-    @app.post("/export/{song_id}", include_in_schema=False)
     def download(song_id: str, body: DownloadBody | None = None):
         """Render on the server (cached) and send the file; also copies it to S3 media when configured."""
         fmt = body.format if body else "mp3"
@@ -448,15 +563,18 @@ def create_app(player: Player | None = None, library: Library | None = None,
 
     @app.post("/like")
     def like(body: IdBody):
+        """Save a track or song to Liked songs."""
         entry, already = save(body.id, liked=True)
         return {"entry": entry, "already": already}
 
     @app.get("/library")
     def library_():
+        """Liked songs, newest first."""
         return {"library": lib.entries()}
 
     @app.patch("/library/{song_id}")
     def rename_song(song_id: str, body: NameBody):
+        """Rename a saved song."""
         return {"entry": lib.rename_song(song_id, body.name)}
 
     @app.delete("/library/{song_id}")
@@ -501,10 +619,12 @@ def create_app(player: Player | None = None, library: Library | None = None,
 
     @app.get("/playlists")
     def playlists():
+        """All playlists (without their songs)."""
         return {"playlists": lib.playlists()}
 
     @app.post("/playlists")
     def create_playlist(body: NewPlaylistBody):
+        """Create an empty playlist."""
         pl = lib.create_playlist(body.name)
         if body.song_id:
             entry, _ = save(body.song_id, liked=False)
@@ -513,6 +633,7 @@ def create_app(player: Player | None = None, library: Library | None = None,
 
     @app.get("/playlists/{pl_id}")
     def playlist(pl_id: str):
+        """One playlist with its songs. The id `liked` is Liked songs."""
         pl = lib.playlist(pl_id)
         if pl is None:
             raise HTTPException(404, "unknown playlist")
@@ -520,10 +641,12 @@ def create_app(player: Player | None = None, library: Library | None = None,
 
     @app.patch("/playlists/{pl_id}")
     def rename_playlist(pl_id: str, body: NameBody):
+        """Rename a playlist."""
         return {"playlist": lib.rename_playlist(pl_id, body.name)}
 
     @app.delete("/playlists/{pl_id}")
     def delete_playlist(pl_id: str):
+        """Delete a playlist (songs that are liked or in another playlist are kept)."""
         lib.delete_playlist(pl_id)
         return {"ok": True}
 
@@ -537,17 +660,28 @@ def create_app(player: Player | None = None, library: Library | None = None,
 
     @app.delete("/playlists/{pl_id}/songs/{song_id}")
     def remove_song_from_playlist(pl_id: str, song_id: str):
+        """Remove a song from a playlist."""
         return {"playlist": lib.remove_from_playlist(pl_id, song_id)}
 
     @app.put("/playlists/{pl_id}/order")
     def reorder(pl_id: str, body: OrderBody):
+        """Set the playlist order (exactly its song ids)."""
         return {"playlist": lib.reorder_playlist(pl_id, body.song_ids)}
+
+    @app.post("/playlists/{pl_id}/shuffle")
+    def shuffle_playlist(pl_id: str, body: ShuffleBody):
+        """Switch shuffle for the playing playlist without restarting the current song."""
+        try:
+            p().set_playlist_shuffle(pl_id, body.mode)
+        except LookupError as e:
+            raise HTTPException(409, str(e)) from e
+        return p().state()
 
     @app.post("/playlists/{pl_id}/play")
     def play_playlist(pl_id: str, body: PlayPlaylistBody | None = None):
         body = body or PlayPlaylistBody()
         try:
-            p().play_playlist(pl_id, body.start, body.shuffle)
+            p().play_playlist(pl_id, body.start, body.shuffle or body.plus, plus=body.plus)
         except LookupError as e:
             raise HTTPException(404, str(e)) from e
         except ValueError as e:
@@ -575,6 +709,7 @@ def create_app(player: Player | None = None, library: Library | None = None,
 
     @app.get("/settings")
     def settings():
+        """All settings (keys and secrets only as set / not set)."""
         return settings_payload()
 
     @app.put("/settings/ai")
@@ -626,18 +761,21 @@ def create_app(player: Player | None = None, library: Library | None = None,
 
     @app.get("/settings/keys")
     def list_keys():
+        """Overlay and API keys (never the tokens)."""
         return {"keys": keys.list()}
 
     @app.post("/settings/keys")
     def create_key(body: NewKeyBody):
+        """Create an overlay key (kind overlay) or an API key with scopes; the token is returned once."""
         try:
-            key, token = keys.create(body.name, body.scopes)
+            key, token = keys.create(body.name, body.scopes, body.kind)
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
         return {"key": key, "token": token}
 
     @app.delete("/settings/keys/{key_id}")
     def revoke_key(key_id: str):
+        """Revoke a key; streams using it close right away."""
         if not keys.revoke(key_id):
             raise HTTPException(404, "unknown key")
         with p().changed:  # wake every stream so one using this key ends right away
@@ -670,11 +808,13 @@ def create_app(player: Player | None = None, library: Library | None = None,
 
     @app.get("/overlay", include_in_schema=False)
     def overlay():
-        """OBS/browser overlay page; its key travels in the URL fragment (#key=…), never to the server."""
+        """OBS/browser overlay page. It needs an overlay key (?key=mo_… or #key=…)."""
         # The key may arrive as ?key=…: don't let it leak through referrers or caches (and the access
         # log redacts it, see RedactKeyFilter).
         return FileResponse(config.WEB_DIR / "overlay.html", media_type="text/html",
                             headers={"Referrer-Policy": "no-referrer", "Cache-Control": "no-store"})
+
+    _tag_routes(app)
 
     if config.WEB_DIR.exists():
         app.mount("/", StaticFiles(directory=config.WEB_DIR, html=True), name="web")

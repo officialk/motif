@@ -29,7 +29,7 @@ def test_repeat_one_replays_the_same_song(client):
     assert client.post("/repeat", json={"mode": "loop"}).status_code == 422
 
 
-def test_repeat_all_wraps_playlist_and_off_ends_it(client):
+def test_repeat_all_wraps_playlist_and_off_stops_at_the_end(client):
     pl = make_playlist(client, 2)
     order = pl["song_ids"]
     client.post("/repeat", json={"mode": "all"})
@@ -38,9 +38,10 @@ def test_repeat_all_wraps_playlist_and_off_ends_it(client):
     assert s["now"]["library_id"] == order[1] and s["up_next"]["library_id"] == order[0]  # wraps
 
     s = client.post("/repeat", json={"mode": "off"}).json()
-    assert s["up_next"]["library_id"] is None  # last song: the radio takes over afterwards
+    assert s["up_next"] is None and s["at_end"] is True  # last song: nothing after it
     s = client.post("/skip", json={"from_id": s["now"]["id"]}).json()
-    assert s["mode"]["playlist"] is None and s["now"]["genre"] == "chiptune"
+    # it stops like a finished album: the first song is cued, paused, still in the playlist
+    assert s["stopped"] is True and s["now"]["library_id"] == order[0] and s["mode"]["playlist"]["id"] == pl["id"]
 
 
 def test_repeat_one_in_playlist_keeps_position(client):
@@ -77,9 +78,8 @@ def test_prompt_with_ai_on_uses_one_playlist_call(client, monkeypatch):
 
     def fake_backend(prompt, settings):
         calls.append(prompt)
-        songs = [{"genre": "techno", "seed": 100 + i, "name": f"Cold Room {i}"} for i in range(7)]
-        songs.append({"genre": "techno", "seed": 100, "name": "Cold Room 0"})  # duplicate is dropped
-        songs.append({"genre": "polka", "seed": 5})  # invalid is skipped
+        songs = [{"genre": "techno", "name": f"Cold Room {i}", "seed": 1} for i in range(7)]  # AI seeds are ignored
+        songs.append({"genre": "polka"})  # invalid is skipped
         return _json.dumps({"title": "Warehouse at 4am", "songs": songs})
 
     monkeypatch.setitem(ai.BACKENDS, "openai", fake_backend)
@@ -91,8 +91,10 @@ def test_prompt_with_ai_on_uses_one_playlist_call(client, monkeypatch):
     pl = s["playlist"]
     assert len(calls) == 1 and "REQUEST_DATA" in calls[0]
     assert pl["name"] == "Warehouse at 4am" and pl["count"] == 8 and pl["genres"] == ["techno"]
+    assert pl["source"] == "ai"  # shown with an AI tag
     names = [x["name"] for x in pl["songs"]]
     assert names[:7] == [f"Cold Room {i}" for i in range(7)] and len(set(pl["song_ids"])) == 8
+    assert len({x["seed"] for x in pl["songs"]}) == 8  # server-picked seeds, all different
     assert [x["source"] for x in pl["songs"]].count("openai") == 7  # last one filled procedurally
     assert procedural.generate("techno", seed=1).genre == "techno"
 
@@ -152,9 +154,36 @@ def test_foreign_origin_and_host_refused(client):
     assert client.get("/state", headers={"host": "rebind.evil.example"}).status_code == 400
 
 
-def test_single_song_playlist_stays_in_playlist_mode_while_playing(client):
+def test_single_song_playlist_stops_after_its_song(client):
     pl = make_playlist(client, 1)
     s = client.post(f"/playlists/{pl['id']}/play", json={}).json()
-    assert s["mode"]["playlist"]["id"] == pl["id"] and s["up_next"]["library_id"] is None
+    assert s["mode"]["playlist"]["id"] == pl["id"] and s["up_next"] is None
     s = client.post("/skip", json={"from_id": s["now"]["id"]}).json()
-    assert s["mode"]["playlist"] is None
+    assert s["stopped"] is True and s["mode"]["playlist"]["id"] == pl["id"]
+
+
+def test_generate_into_playlist_appends_and_joins_queue(client, monkeypatch):
+    import json as _json
+    calls = []
+
+    def fake_backend(prompt, settings):
+        calls.append(prompt)
+        n = _json.loads(prompt.split("REQUEST_DATA")[1].split("\n", 1)[1].split("\n\n")[0])["songs"]
+        return _json.dumps({"title": "x", "songs": [{"genre": "jazz", "name": f"Extra {i}"} for i in range(n)]})
+
+    monkeypatch.setitem(ai.BACKENDS, "openai", fake_backend)
+    try:
+        ai.set_settings(ai.AISettings(**{**ai.AISettings.from_config().__dict__, "backend": "openai"}))
+        pl = client.post("/prompt", json={"text": "rainy jazz", "count": 2}).json()["playlist"]
+        assert pl["prompt"] == "rainy jazz"
+        r = client.post(f"/playlists/{pl['id']}/generate", json={"count": 2, "genre": "lofi"}).json()
+    finally:
+        ai.set_settings(ai.AISettings.from_config())
+    assert [a["genre"] for a in r["added"]] == ["lofi", "lofi"]  # a pinned genre wins
+    assert r["playlist"]["count"] == 4
+    data = calls[1].split("REQUEST_DATA")[1]
+    assert "already_in_playlist" in data and "rainy jazz" in data  # same vibe, knows what's there
+    assert client.player.mode.order[-2:] == [a["id"] for a in r["added"]]
+    assert client.post("/playlists/nope/generate", json={}).status_code == 404
+    assert client.get("/genres").json()["details"][0]["tempo_bpm"]
+

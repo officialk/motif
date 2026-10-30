@@ -223,14 +223,16 @@ Motif can be driven from outside — a stream overlay, Streamer.bot / Firebot re
 
 **Speaker and remotes.** Exactly one client plays audio: the *speaker*. An overlay always becomes the speaker; a site tab becomes it only when nothing else is playing, or with **Play here**. Every other page is a remote: it shows the speaker's position and sends pause/seek/volume as commands. Only the speaker hands over to the next song at the end of the last bar.
 
-**API keys.** Create them in Settings → API keys with only the scopes needed. The token is shown once; only its hash is stored.
+**Keys.** There are two kinds, each shown once on creation (only a hash is stored):
+
+- **API keys** (`mk_…`, Settings → API keys) for tools and bots, with only the scopes they need (below). They can't open an overlay.
+- **Overlay keys** (`mo_…`, Settings → Overlays) for overlay pages: they play the audio, show what's playing and advance at a song's end, nothing else. Only overlay keys open an overlay.
 
 | Scope | Allows |
 |---|---|
 | `read` | `GET /state`, `/events`, `/history`, `/library`, `/playlists`, `/playlists/{id}`, `/genres`, `/audio/{id}.mp3` |
-| `control` | `POST /skip`, `/repeat`, `/genre`, `/random`, `/play`, `/playlists/{id}/play`, `/like`, `/control` (60/min) |
-| `request` | `POST /prompt` (6/min; makes AI calls when a backend is on) |
-| `speaker` | `POST /speaker/claim`, `/playback`, plus `read` (for the overlay) |
+| `control` | `POST /skip`, `/repeat`, `/previous`, `/queue/jump`, `/genre`, `/random`, `/play`, `/playlists/{id}/play`, `/playlists/{id}/shuffle`, `/like`, `/control` (60/min) |
+| `request` | `POST /prompt`, `POST /playlists/{id}/generate` (6/min; makes AI calls when a backend is on) |
 
 Settings, keys, backups, downloads and library edits are never reachable with a key. Send the key as a header:
 
@@ -246,33 +248,37 @@ curl -X POST http://127.0.0.1:8000/genre -H "Authorization: Bearer mk_..." -H "C
 curl -X POST http://127.0.0.1:8000/control -H "Authorization: Bearer mk_..." -H "Content-Type: application/json" -d '{"action": "toggle"}'
 ```
 
-**Overlay.** Add a Browser Source in OBS (or open it in a tab) with the URL built in Settings → API keys:
+**Overlay.** Add a Browser Source in OBS (or open it in a tab) with the URL shown when you create one in Settings → Overlays:
 
 ```
-http://127.0.0.1:8000/overlay?layout=card&pos=bl&key=mk_...
+http://127.0.0.1:8000/overlay?layout=card&pos=bl&key=mo_...
 ```
 
-- Give the overlay a key with only the `speaker` scope (or `read` with `audio=0`). The overlay removes `key` from the address bar, keeps it for the tab's session (so OBS refreshes still work), and sends it only as an `Authorization` header; the server masks `key=` in its access log. `#key=…` also works. Without a key the overlay doesn't connect, so revoking the key always stops it.
+- Each overlay has its own overlay key (revoke it to disconnect just that overlay). The overlay removes `key` from the address bar, keeps it for the tab's session (so OBS refreshes still work), and sends it only as an `Authorization` header; the server masks `key=` in its access log. `#key=…` also works. Without a key the overlay doesn't connect, so revoking the key always stops it.
 - `layout=card|bar|mini`, `pos=bl|br|tl|tr`, `progress=0|1`, `audio=1|0` (`0` = display only, no sound), `viz=1` (live audio bars in the art), `name=…` (label in the site's **Play on** menu).
 - In OBS tick **Control audio via OBS** to give the music its own mixer fader, and turn off **Shutdown source when not visible** so scene switches don't stop the music. In a normal browser tab, click once to allow sound.
 
 **Events stream** (`GET /events?client=<id>&kind=overlay|site`): `event: state` with `data` = `{version, state, speaker, playback, command, server_time}`; a `: ping` comment every 15 s keeps idle connections open.
 
-**Twitch channel points.** Point a reward in Streamer.bot / Firebot / SAMMI at an HTTP request: e.g. "Skip song" → `POST /skip`, "Switch radio" → `POST /genre` with the viewer's text as `genre`, "Request a vibe" → `POST /prompt` with `{"text": "<viewer input>"}`. Use a key with `control` (and `request` for prompts).
+**Twitch channel points.** Point a reward in Streamer.bot / Firebot / SAMMI at an HTTP request: e.g. "Skip song" → `POST /skip`, "Switch radio" → `POST /genre` with the viewer's text as `genre`, "Request a vibe" → `POST /prompt` with `{"text": "<viewer input>"}`, "Add a song" → `POST /playlists/<id>/generate` with `{"genre": "<viewer pick>"}` (the list of genre ids is at `GET /genres`; open pages update live). Use a key with `control` (and `request` for prompts).
 
 ## API
 
-JSON in and out. Errors are `{"detail": "..."}` with a 4xx status. `GET /state` returns `{now, up_next, history, mode}`.
+JSON in and out; full interactive docs (grouped by player, queue, live, library, playlists, settings, keys, admin) are at `/docs`. Errors are `{"detail": "..."}` with a 4xx status (422 for an invalid body, e.g. an unknown genre). `GET /state` returns `{now, up_next, mode, at_end, stopped}`, and every player action answers with the same state.
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/genres` | | genres and AI backend |
-| GET | `/state`, `/now`, `/queue` | | state / now + mode / up next |
+| GET | `/genres` | | genre ids a request can name (with display name and bpm range) and the AI backend. Interactive docs for every endpoint: `/docs` |
+| GET | `/state` | | the player state |
 | GET | `/history` | | persisted play history |
 | POST | `/genre` | `{genre, mood?}` | start a radio |
 | POST | `/random` | `{mood?}` | shuffle radios |
 | POST | `/prompt` | `{text, count?}` | create a playlist of `count` (default 8, 2–20) songs from the prompt and play it |
-| POST | `/skip` | `{from_id?}` | next song (`from_id` guards double skips) |
+| POST | `/playlists/{id}/generate` | `{genre?, prompt?, count?}` | add `count` (1–10) new songs to a playlist; `genre` pins the radio, otherwise the AI picks in the playlist's vibe; joins the queue if it's playing |
+| POST | `/skip` | `{from_id?, manual?}` | next song (`from_id` guards double skips; `manual` = Next pressed, so Shuffle+ plays a playlist song instead of waiting for a new one). At the end of a playlist with repeat off, the first song is cued and paused (`stopped` in the state) |
+| POST | `/previous` | | previous song in the queue (radio / Shuffle+: the last one played); `moved: false` when there is none |
+| GET | `/queue` | | the play list as `items` with the playing song at `current`: a playlist's whole queue in play order (with `pos`, and `repeats` when it loops), or for a radio / Shuffle+ the songs played this session, the current one and the next |
+| POST | `/queue/jump` | `{pos}` | play the playlist queue from that position |
 | POST | `/repeat` | `{mode}` | `off`, `all` or `one` |
 | POST | `/like` | `{id}` | save a song |
 | GET | `/library` | | saved songs, newest first |
@@ -287,7 +293,8 @@ JSON in and out. Errors are `{"detail": "..."}` with a 4xx status. `GET /state` 
 | POST | `/playlists/{id}/songs` | `{id}` | add a song (saves it if needed) |
 | DELETE | `/playlists/{id}/songs/{song_id}` | | remove a song |
 | PUT | `/playlists/{id}/order` | `{song_ids}` | reorder |
-| POST | `/playlists/{id}/play` | `{start?, shuffle?}` | play the playlist |
+| POST | `/playlists/{id}/shuffle` | `{mode}`: `off`, `on` or `auto` | switch shuffle for the playing playlist without restarting the song (`auto` = Shuffle+) |
+| POST | `/playlists/{id}/play` | `{start?, shuffle?, plus?}` | play the playlist; `plus` is Shuffle+ (AI playlists): a radio on the playlist; each next song is one of its songs or, at the AI share of radio, a new one from its prompt (played, not saved). The id `liked` plays Liked songs |
 | POST | `/download/{id}` | `{format: mp3\|wav}` | file attachment, rendered on the server |
 | GET | `/audio/{track_id}.mp3` | | audio of a ready track |
 | GET | `/settings` | | AI and storage settings |

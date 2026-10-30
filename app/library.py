@@ -41,6 +41,7 @@ SONG_ID = re.compile(r"[0-9a-f]{16}")
 TABLES = dbmod.REQUIRED_TABLES
 ENTRY_FIELDS = ("id", "name", "genre", "tempo", "key", "scale", "bars", "music_seconds", "duration",
                 "source", "seed", "liked_at", "liked")
+LIKED_ID = "liked"  # virtual playlist id for Liked songs
 HISTORY_FIELDS = ("id", "hash", "name", "genre", "tempo", "key", "scale", "music_seconds", "source", "played_at")
 
 
@@ -212,16 +213,24 @@ class Library:
             return [self._expand(db, r, with_songs=False) for r in rows]
 
     def playlist(self, pl_id: str) -> Optional[dict]:
+        if pl_id == LIKED_ID:  # Liked songs plays like a playlist (newest first); it can't be edited as one
+            songs = self.entries()
+            return {"id": LIKED_ID, "name": "Liked songs", "source": None, "prompt": None, "songs": songs,
+                    "song_ids": [s["id"] for s in songs], "count": len(songs),
+                    "seconds": sum(s["music_seconds"] or 0 for s in songs),
+                    "genres": sorted({s["genre"] for s in songs})}
         with self._db() as db:
             row = db.execute("SELECT * FROM playlists WHERE id = ?", (pl_id,)).fetchone()
             return self._expand(db, row, with_songs=True) if row else None
 
-    def create_playlist(self, name: str) -> dict:
+    def create_playlist(self, name: str, source: Optional[str] = None, prompt: Optional[str] = None) -> dict:
+        """`source` marks how it was made ("ai" for a playlist the AI composed); `prompt` is what it was
+        made from, so more songs can be generated in the same vibe later."""
         name = clean_name(name)
         pl_id, now = uuid.uuid4().hex[:10], time.time()
         with self.lock, self._db() as db:
-            db.execute("INSERT INTO playlists (id, name, created, updated) VALUES (?, ?, ?, ?)",
-                       (pl_id, name, now, now))
+            db.execute("INSERT INTO playlists (id, name, created, updated, source, prompt) VALUES (?, ?, ?, ?, ?, ?)",
+                       (pl_id, name, now, now, source, prompt))
         return self.playlist(pl_id)
 
     def _touch(self, db: Conn, pl_id: str) -> None:

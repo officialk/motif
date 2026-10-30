@@ -12,6 +12,12 @@ def new_key(client, *scopes, name="bot"):
     return r.json()["token"]
 
 
+def overlay_key(client, name="OBS"):
+    r = client.post("/settings/keys", json={"name": name, "kind": "overlay"})
+    assert r.status_code == 200, r.text
+    return r.json()["token"]
+
+
 def auth(token):
     return {"Authorization": f"Bearer {token}"}
 
@@ -69,8 +75,8 @@ def test_rate_limit(client, monkeypatch):
     assert codes == [200, 200, 429]
 
 
-def test_speaker_scope_implies_read_only(client):
-    token = new_key(client, "speaker")
+def test_overlay_key_reads_but_cant_control(client):
+    token = overlay_key(client)
     assert client.get("/state", headers=auth(token)).status_code == 200
     assert client.post("/genre", json={"genre": "lofi"}, headers=auth(token)).status_code == 403
 
@@ -95,7 +101,7 @@ def test_speaker_claim_rules_and_release_on_disconnect(client):
     assert client.post("/speaker/claim", json={"client": "tab2", "kind": "site"}).json()["speaker"]["client"] == "tab1"
     assert client.post("/speaker/claim", json={"client": "tab2", "kind": "site", "force": True}).json()["speaker"]["client"] == "tab2"
     # an overlay always takes over
-    token = new_key(client, "speaker")
+    token = overlay_key(client)
     r = client.post("/speaker/claim", json={"client": "obs", "kind": "overlay"}, headers=auth(token)).json()
     assert r["speaker"] == {"client": "obs", "kind": "overlay", "since": pytest.approx(r["speaker"]["since"])}
     # its stream closing releases it
@@ -122,8 +128,8 @@ def test_overlay_page_served(client):
     assert r.status_code == 200 and "text/html" in r.headers["content-type"]
 
 
-def test_speaker_key_can_only_do_the_end_of_song_handover(client):
-    token = new_key(client, "speaker")
+def test_overlay_key_can_only_do_the_end_of_song_handover(client):
+    token = overlay_key(client)
     s = client.post("/genre", json={"genre": "chiptune"}).json()
     assert client.post("/skip", json={}, headers=auth(token)).status_code == 403  # free skip: no
     r = client.post("/skip", json={"from_id": s["now"]["id"]}, headers=auth(token))
@@ -152,7 +158,7 @@ def test_connected_players_listed_and_assignable(client):
 def test_revoking_a_key_ends_its_open_stream_and_speaker_role(client):
     import threading
 
-    r = client.post("/settings/keys", json={"name": "OBS", "scopes": ["speaker"]}).json()
+    r = client.post("/settings/keys", json={"name": "OBS", "kind": "overlay"}).json()
     token, key_id = r["token"], r["key"]["id"]
     client.post("/speaker/claim", json={"client": "obs", "kind": "overlay"}, headers=auth(token))
     assert client.player.speaker["client"] == "obs"
@@ -166,3 +172,27 @@ def test_revoking_a_key_ends_its_open_stream_and_speaker_role(client):
                 events += 1
     assert events >= 1 and client.player.speaker is None
     assert client.get("/state", headers=auth(token)).status_code == 401
+
+
+def test_overlay_and_api_keys_are_separate_kinds(client):
+    ov = client.post("/settings/keys", json={"name": "Stream PC", "kind": "overlay", "scopes": ["control"]}).json()
+    assert ov["token"].startswith("mo_") and ov["key"]["kind"] == "overlay"
+    assert ov["key"]["scopes"] == ["speaker"]  # fixed: requested scopes are ignored for overlays
+    api_token = new_key(client, "read")
+    assert api_token.startswith("mk_")
+    # API keys can't play audio, and only overlay keys open an overlay
+    assert client.post("/settings/keys", json={"name": "x", "scopes": ["speaker"]}).status_code == 400
+    r = client.get("/events", params={"client": "obs", "kind": "overlay"}, headers=auth(api_token))
+    assert r.status_code == 403 and "overlay key" in r.json()["detail"]
+    assert read_events(client, 1, headers=auth(ov["token"]), client="obs", kind="overlay")
+    kinds = {k["name"]: k["kind"] for k in client.get("/settings/keys").json()["keys"]}
+    assert kinds == {"Stream PC": "overlay", "bot": "api"}
+
+
+def test_old_speaker_keys_become_overlay_keys(client):
+    lib = client.library
+    with lib.db.connect() as db:  # a key from before key kinds existed
+        db.execute("INSERT INTO api_keys (id, name, hash, scopes, prefix, created, last_used) "
+                   "VALUES ('old1', 'Old overlay', 'h', 'read,control,speaker', 'mk_abcd', 0, NULL)")
+    keys = apikeys.ApiKeys(lib.db)
+    assert {k["id"]: k["kind"] for k in keys.list()}["old1"] == "overlay"

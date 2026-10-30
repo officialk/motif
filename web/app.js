@@ -103,7 +103,6 @@ let settings = null;
 let backups = null;         // {enabled, backups}
 let apiKeys = null;         // GET /settings/keys: {keys} | {error}
 let audioFail = { id: null, at: 0 };
-const liked = { q: "", genre: "", sort: "newest" };
 const models = new Map();   // row key -> row model (for event delegation)
 let route = { name: "home" };
 let mountedRoute = "";
@@ -213,6 +212,10 @@ function onLive(type, d) {
   if (type !== "state" || !d || typeof d !== "object") return;
   if (live.version !== null && typeof d.version === "number" && d.version <= live.version) return;
   if (typeof d.version === "number") live.version = d.version;
+  if (typeof d.library_rev === "number" && d.library_rev !== live.libraryRev) {
+    if (live.libraryRev !== undefined) loadLib();  // e.g. a chat request added songs to a playlist
+    live.libraryRev = d.library_rev;
+  }
   if (typeof d.server_time === "number") live.offset = d.server_time - Date.now() / 1000;
   const sp = d.speaker || null;
   // An event older than our own claim can still say someone else is the speaker; ignore that.
@@ -298,8 +301,7 @@ async function refresh() {
   try {
     S = await api("/state");
   } catch {
-    setStatus("Server unreachable", true);
-    return;
+    return; // the stream's reconnect handles a server that's down
   }
   afterState();
 }
@@ -311,6 +313,7 @@ function afterState() {
   renderView();
   highlight();
   reconcile();
+  queueMaybeChanged();
   const nowId = S?.now?.id ?? null;
   if (nowId !== lastNowId) {
     lastNowId = nowId;
@@ -325,6 +328,15 @@ function reconcile() {
   if (!now || now.status !== "ready") return;
   if (out.cur?.id === now.id || out.pending?.id === now.id || awaitingId) return;
   const buf = out.buffer(now.id);
+  if (buf && S.stopped) {
+    // The playlist ended: its first song is cued, paused, until play is pressed.
+    wantPaused = true;
+    out.playNow(now, buf);
+    out.pause().catch(() => {});
+    report();
+    renderPlayer();
+    return;
+  }
   if (buf) {
     out.playNow(now, buf);
     if (resumeAt?.id === now.id && resumeAt.t > 1) out.seek(Math.min(resumeAt.t, (now.music_seconds || resumeAt.t) - 1));
@@ -361,6 +373,11 @@ function tick() {
   renderProgress(pos);
   if (!S || !S.now || S.now.id !== out.cur.id || out.pending || awaitingId) return;
   const next = S.up_next;
+  if (!next && S.at_end) {
+    // Last song of a playlist (repeat off): when it ends, the server cues the first one, paused.
+    if (pos && pos.t >= pos.music) confirmAdvance(out.cur.id, "end");
+    return;
+  }
   const buf = next && next.status === "ready" ? out.buffer(next.id) : null;
   if (!buf) return; // not ready yet: the current song rings out, the next starts as soon as it is
   const fromId = out.cur.id;
@@ -393,6 +410,55 @@ async function loadLib() {
   if (route.name === "playlist") loadPlaylist(route.id);
   renderView();
   highlight();
+}
+
+// Shuffle (player bar, like Spotify): off = in order, on = random order,
+// auto = Shuffle+ (AI playlists): random order with a new song mixed in now and then.
+// It switches the playing playlist in place and is remembered per playlist for the next Play.
+const SHUFFLE_TIP = {
+  off: "Enable shuffle", on: "Shuffle: on",
+  auto: "Shuffle+: random order, with new songs mixed in now and then",
+};
+function playPlaylist(id, start) {
+  const sh = shuffleOf(id);
+  return act(() => api(`/playlists/${enc(id)}/play`, { start, shuffle: sh !== "off", plus: sh === "auto" }));
+}
+function shuffleOf(id) {
+  const mp = S?.mode?.playlist;
+  if (mp?.id === id) return mp.plus ? "auto" : mp.shuffle ? "on" : "off";
+  return store.get(`shuffle:${id}`, "off");
+}
+async function cycleShuffle(id, ai) {
+  const next = { off: "on", on: ai ? "auto" : "off", auto: "off" }[shuffleOf(id)];
+  store.set(`shuffle:${id}`, next);
+  if (S?.mode?.playlist?.id === id) await act(() => api(`/playlists/${enc(id)}/shuffle`, { mode: next }));
+  toast({ off: "Shuffle off", on: "Shuffle on", auto: "Shuffle+ on" }[next]);
+}
+
+// "Generate new" on an AI playlist: the AI adds songs in the playlist's vibe (server picks the seeds).
+const plGenerating = new Set();
+function generateMenu(el) {
+  const id = el.dataset.pl;
+  openMenu(el, [{ heading: "Add new songs" }, ...[1, 3, 5].map((n) => ({
+    label: `${n} song${n === 1 ? "" : "s"}`, run: () => generateInto(id, n),
+  }))]);
+}
+
+async function generateInto(id, count) {
+  if (plGenerating.has(id)) return;
+  plGenerating.add(id);
+  if (route.name === "playlist" && route.id === id) fillPlaylist();
+  try {
+    const r = await api(`/playlists/${enc(id)}/generate`, { count });
+    if (r.playlist) plDetail.set(id, r.playlist);
+    toast(`Added ${r.added.length} song${r.added.length === 1 ? "" : "s"}`);
+    await loadLib();
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    plGenerating.delete(id);
+    if (route.name === "playlist" && route.id === id) { renderView(); highlight(); }
+  }
 }
 
 async function loadPlaylist(id) {
@@ -502,7 +568,7 @@ function rowHtml(m, i) {
   models.set(key, m);
   const k = `data-m="${esc(key)}"`;
   const isLiked = !!savedId(m);
-  const tag = m.source && m.source !== "procedural" ? `<span class="tag">${esc(m.source)}</span>` : "";
+  const tag = m.source && m.source !== "procedural" ? `<span class="tag" title="Made with ${esc(m.source)}">AI</span>` : "";
   const sub = [m.genre ? esc(genreLabel(m.genre)) : "", m.showStatus ? statusBadge(m.status) : ""].filter(Boolean).join(" ");
   const ready = !m.tid || m.status === "ready";
   const moves = m.ctx === "pl"
@@ -527,8 +593,7 @@ function parseRoute() {
   const h = location.hash.replace(/^#\/?/, "");
   const [name, ...rest] = h.split("/");
   if (name === "playlist" && rest[0]) return { name: "playlist", id: decodeURIComponent(rest.join("/")) };
-  if (name === "queue") return { name: "history" }; // old links
-  if (["home", "history", "settings", "liked"].includes(name)) return { name };
+  if (["home", "history", "queue", "settings", "liked"].includes(name)) return { name };
   return { name: "home" };
 }
 
@@ -556,6 +621,7 @@ async function onRoute() {
     loadSettings();
   }
   if (route.name === "history") loadHistory();
+  if (route.name === "queue") loadQueue();
   if (route.name === "playlist") loadPlaylist(route.id);
   renderSidebar();
   renderView();
@@ -572,7 +638,7 @@ function renderView() {
     view._html = null;
     view.innerHTML = skeleton(route);
   }
-  ({ home: fillHome, history: fillHistory, settings: fillSettings, liked: fillLiked, playlist: fillPlaylist })[route.name]();
+  ({ home: fillHome, history: fillHistory, queue: fillQueue, settings: fillSettings, liked: fillLiked, playlist: fillPlaylist })[route.name]();
 }
 
 function skeleton(r) {
@@ -583,19 +649,14 @@ function skeleton(r) {
         <div id="v-radios" class="tiles"></div>
         <div class="section-title"><h2>Your playlists</h2></div>
         <div id="v-playlists"></div>`;
+    case "queue":
+      return `<h1>Queue</h1><div id="v-queue"></div>`;
     case "history":
       return `<h1>Recently played</h1><div id="v-history-meta" class="muted"></div><div id="v-history" style="margin-top:12px"></div>`;
     case "liked":
       return `<div class="hero"><div class="art liked-art">${icon("favorite")}</div><div><div class="kind">PLAYLIST</div><h1>Liked songs</h1><div id="v-liked-meta" class="muted"></div></div></div>
-        <div class="toolbar">
-          <input id="liked-q" type="search" placeholder="Search liked songs" aria-label="Search liked songs" value="${esc(liked.q)}">
-          <select id="liked-sort" aria-label="Sort">
-            ${[["newest", "Recently added"], ["name", "Name"], ["genre", "Genre"], ["tempo", "Tempo"], ["length", "Length"]]
-              .map(([v, l]) => `<option value="${v}" ${liked.sort === v ? "selected" : ""}>${l}</option>`).join("")}
-          </select>
-        </div>
-        <div id="v-chips" class="chips"></div>
-        <div id="v-liked" style="margin-top:12px"></div>`;
+        <div id="v-liked-actions" class="actions"></div>
+        <div id="v-liked"></div>`;
     case "playlist":
       return `<div id="v-pl-hero"></div><div id="v-pl-actions" class="actions"></div><div id="v-pl-rows"></div>`;
     case "settings":
@@ -628,9 +689,40 @@ function fillHome() {
   setHTML($("v-playlists"), playlists.length
     ? `<div class="hscroll">${playlists.map((p) => `<div class="tile" role="button" tabindex="0" data-a="go" data-href="#/playlist/${enc(p.id)}" data-plid="${esc(p.id)}">
         ${playlistArt("art", p)}
-        <div class="tile-name">${esc(p.name)}</div><div class="tile-sub">${p.count} song${p.count === 1 ? "" : "s"}</div>
+        <div class="tile-name">${esc(p.name)}${p.source === "ai" ? '<span class="tag">AI</span>' : ""}</div><div class="tile-sub">${p.count} song${p.count === 1 ? "" : "s"}</div>
         <button class="hover-play" data-a="pl-play" data-pl="${esc(p.id)}" title="Play" aria-label="Play ${esc(p.name)}" ${p.count ? "" : "disabled"}>${icon("play_arrow")}</button></div>`).join("")}</div>`
     : `<div class="empty">No playlists yet. Describe a vibe above, or use ${icon("add", "inline")} next to “Your library” or on any song.</div>`);
+}
+
+// ---------- queue ----------
+let queueData = null, queueKey = "";
+async function loadQueue() {
+  try { queueData = await api("/queue"); } catch (e) { queueData = { error: e.message }; }
+  if (route.name === "queue") { renderView(); highlight(); }
+}
+// Reload the queue when what plays (or the order) changes.
+function queueMaybeChanged() {
+  if (route.name !== "queue" || !S) return;
+  const key = JSON.stringify([S.now?.id, S.up_next?.id, S.up_next?.status, S.mode, S.stopped]);
+  if (key !== queueKey) { queueKey = key; loadQueue(); }
+}
+let queueScrolledTo = null;
+function fillQueue() {
+  const q = queueData;
+  if (!q) return setHTML($("v-queue"), '<div class="empty">Loading…</div>');
+  if (q.error) return setHTML($("v-queue"), `<div class="empty">Could not load the queue: ${esc(q.error)}</div>`);
+  // One list: played above, the current song highlighted, what's next below.
+  const rows = q.items.map((t, n) => (q.radio
+    ? trackRow(t, n < (q.current ?? q.items.length) ? "recent" : n === q.current ? "now" : "next")
+    : entryRow(t, "queue", { pos: t.pos })));
+  setHTML($("v-queue"), rows.length
+    ? rowsHtml(rows) + (q.repeats ? `<div class="muted queue-note">${icon("repeat", "inline")} Then it repeats</div>` : "")
+    : '<div class="empty">Nothing playing.</div>');
+  const key = `${S?.now?.id}:${q.current}`;
+  if (q.current !== null && queueScrolledTo !== key) {
+    queueScrolledTo = key;
+    requestAnimationFrame(() => document.querySelectorAll("#v-queue .row")[q.current]?.scrollIntoView({ block: "center" }));
+  }
 }
 
 function fillHistory() {
@@ -642,27 +734,11 @@ function fillHistory() {
 function fillLiked() {
   const total = library.reduce((a, e) => a + (e.music_seconds || 0), 0);
   setHTML($("v-liked-meta"), `${library.length} song${library.length === 1 ? "" : "s"}${library.length ? ` · ${fmtLong(total)}` : ""}`);
-  const counts = new Map();
-  for (const e of library) counts.set(e.genre, (counts.get(e.genre) || 0) + 1);
-  if (liked.genre && !counts.has(liked.genre)) liked.genre = "";
-  setHTML($("v-chips"), counts.size > 1
-    ? [`<button class="chip${liked.genre ? "" : " on"}" data-a="chip" data-genre="">All ${library.length}</button>`]
-      .concat([...counts].sort((a, b) => b[1] - a[1]).map(([g, n]) => `<button class="chip${liked.genre === g ? " on" : ""}" data-a="chip" data-genre="${esc(g)}">${esc(genreLabel(g))} ${n}</button>`)).join("")
-    : "");
-  const q = liked.q.trim().toLowerCase();
-  let list = library.filter((e) => (!liked.genre || e.genre === liked.genre)
-    && (!q || `${e.name} ${e.genre} ${e.key} ${e.scale} ${e.source}`.toLowerCase().includes(q)));
-  const by = {
-    newest: (a, b) => (b.liked_at || 0) - (a.liked_at || 0),
-    name: (a, b) => String(a.name).localeCompare(String(b.name)),
-    genre: (a, b) => String(a.genre).localeCompare(String(b.genre)) || String(a.name).localeCompare(String(b.name)),
-    tempo: (a, b) => (a.tempo || 0) - (b.tempo || 0),
-    length: (a, b) => (a.music_seconds || 0) - (b.music_seconds || 0),
-  }[liked.sort];
-  list = [...list].sort(by);
+  setHTML($("v-liked-actions"), `<button class="big-play" id="pl-big-play" data-a="pl-play" data-pl="liked" title="Play" aria-label="Play" ${library.length ? "" : "disabled"}>${icon("play_arrow")}</button>`);
+  const list = [...library].sort((a, b) => (b.liked_at || 0) - (a.liked_at || 0));
   setHTML($("v-liked"), list.length
     ? rowsHtml(list.map((e) => entryRow(e, "lib")))
-    : `<div class="empty">${library.length ? "No songs match." : `Songs you like (${icon("favorite", "inline")}) show up here.`}</div>`);
+    : `<div class="empty">Songs you like (${icon("favorite", "inline")}) show up here.</div>`);
 }
 
 function fillPlaylist() {
@@ -682,10 +758,11 @@ function fillPlaylist() {
   const count = p.count ?? songs.length;
   const secs = p.seconds ?? songs.reduce((a, s) => a + (s.music_seconds || 0), 0);
   const gs = p.genres || [...new Set(songs.map((s) => s.genre))];
-  setHTML($("v-pl-hero"), `<div class="hero">${playlistArt("art", p)}<div><div class="kind">PLAYLIST</div><h1>${esc(p.name)}</h1>
+  setHTML($("v-pl-hero"), `<div class="hero">${playlistArt("art", p)}<div><div class="kind">${p.source === "ai" ? "AI PLAYLIST" : "PLAYLIST"}</div><h1>${esc(p.name)}</h1>
+    ${p.source === "ai" && p.prompt ? `<div class="pl-prompt">${icon("auto_awesome", "inline")}“${esc(p.prompt)}”</div>` : ""}
     <div class="muted">${count} song${count === 1 ? "" : "s"}${count ? ` · ${fmtLong(secs)}` : ""}${gs.length ? ` · ${gs.map((g) => esc(genreLabel(g))).join(", ")}` : ""}</div></div></div>`);
   setHTML($("v-pl-actions"), `<button class="big-play" id="pl-big-play" data-a="pl-play" data-pl="${esc(id)}" title="Play" aria-label="Play" ${count ? "" : "disabled"}>${icon("play_arrow")}</button>
-    <button class="pill" data-a="pl-shuffle" data-pl="${esc(id)}" ${count ? "" : "disabled"}>${icon("shuffle")}Shuffle play</button>
+    ${p.source === "ai" ? `<button class="pill" data-a="pl-generate" data-pl="${esc(id)}" ${plGenerating.has(id) ? "disabled" : ""}>${icon("auto_awesome")}${plGenerating.has(id) ? "Generating…" : "Generate new"}</button>` : ""}
     <button class="pill" data-a="pl-rename" data-pl="${esc(id)}">Rename</button>
     <button class="pill" data-a="pl-delete" data-pl="${esc(id)}">Delete</button>`);
   if (!pl) { setHTML($("v-pl-rows"), '<div class="empty">Loading songs…</div>'); return; }
@@ -838,8 +915,9 @@ function backupsHtml(st) {
 }
 
 function fillSettings() {
-  if (!$("keys-card")) setHTML($("v-keys"), keysCardHtml());
-  setHTML($("keys-list"), keysListHtml());
+  if (!$("overlay-keys-card")) setHTML($("v-keys"), keysCardHtml());
+  setHTML($("overlay-list"), keysListHtml("overlay"));
+  setHTML($("api-list"), keysListHtml("api"));
   if (!settings || settings.error) {
     setHTML($("v-app"), "");
     setHTML($("v-ai"), settings ? `<div class="empty">Could not load settings: ${esc(settings.error)}</div>` : '<div class="empty">Loading settings…</div>');
@@ -853,105 +931,137 @@ function fillSettings() {
   setHTML($("v-backups"), backupsHtml(settings.storage || {}));
 }
 
-// ---------- API keys ----------
-// The token is shown once, right after creating; the server only keeps a hash.
+// ---------- overlays and API keys ----------
+// Two kinds of key: overlay keys (mo_…) open an overlay page and play its audio; API keys
+// (mk_…) are for tools and bots. A token is shown once, right after creating; the server keeps a hash.
 const KEY_SCOPES = [
   ["read", "See what's playing"],
   ["control", "Play, pause, skip, pick music"],
   ["request", "Make playlists from prompts"],
-  ["speaker", "Play the audio (overlay)"],
 ];
-let newKey = null; // {token, scopes} until "Done"
+let keyForm = null; // "overlay" | "api" while its New form is open
+let newKey = null;  // {kind, token} until "Done"
 
 function keysCardHtml() {
-  const scopes = KEY_SCOPES.map(([s, label]) => `<label class="scope" for="ks-${s}"><input type="checkbox" id="ks-${s}" value="${s}" ${s === "request" ? "" : "checked"}>
-      <span class="scope-name">${s}</span><span class="scope-label">${esc(label)}</span></label>`).join("");
-  return `<section class="card" id="keys-card" aria-labelledby="keys-h">
-    <div class="card-head"><h2 id="keys-h">API keys</h2></div>
-    <div id="keys-list"></div>
-    <div id="key-new"></div>
-    <h3 class="sub-h">New key</h3>
-    <div class="field"><label for="key-name">Name</label><input id="key-name" maxlength="60" value="Overlay" spellcheck="false" autocomplete="off"></div>
-    <div class="field"><span class="flabel">Scopes</span><div class="scopes" role="group" aria-label="Scopes">${scopes}</div></div>
-    <div class="actions"><button type="button" class="pill accent" data-a="key-create">${icon("key")}Create key</button></div>
+  const card = (kind, title, btn) => `<section class="card" id="${kind}-keys-card" aria-labelledby="${kind}-keys-h">
+    <div class="card-head"><h2 id="${kind}-keys-h">${title}</h2>
+      <button type="button" class="pill small" data-a="key-new" data-kind="${kind}">${icon("add")}${btn}</button></div>
+    <div id="${kind}-form"></div>
+    <div id="${kind}-new"></div>
+    <div id="${kind}-list" class="keylist"></div>
   </section>`;
+  return card("overlay", "Overlays", "New overlay") + card("api", "API keys", "New API key");
 }
 
-function keysListHtml() {
-  if (!apiKeys) return '<div class="empty">Loading keys…</div>';
+function ago(ts) {
+  const s = Date.now() / 1000 - ts;
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  if (s < 86400 * 30) return `${Math.floor(s / 86400)} d ago`;
+  return fmtDate(ts);
+}
+
+function keysListHtml(kind) {
+  if (!apiKeys) return '<div class="empty">Loading…</div>';
   if (apiKeys.error) return `<div class="empty">Could not load keys: ${esc(apiKeys.error)}</div>`;
-  if (!apiKeys.keys?.length) return '<div class="empty">No keys yet.</div>';
-  return apiKeys.keys.map((k) => `<div class="apikey"><div class="meta">
-      <div class="apikey-name">${esc(k.name)} <code>${esc(k.prefix)}…</code></div>
-      <div class="chips-row">${(k.scopes || []).map((s) => `<span class="kpill">${esc(s)}</span>`).join("")}</div>
-      <div class="muted small">Created ${esc(fmtDate(k.created))} · ${k.last_used ? `last used ${esc(fmtDate(k.last_used))}` : "never used"}</div></div>
-    <button type="button" class="pill small" data-a="key-revoke" data-id="${esc(k.id)}" data-name="${esc(k.name)}">Revoke</button></div>`).join("");
+  const list = (apiKeys.keys || []).filter((k) => (k.kind || "api") === kind);
+  if (!list.length) return `<div class="empty small">${kind === "overlay" ? "No overlays yet." : "No API keys yet."}</div>`;
+  return list.map((k) => `<div class="keyrow">
+      <span class="key-ico">${icon(kind === "overlay" ? "cast" : "key")}</span>
+      <div class="key-meta">
+        <div class="key-name">${esc(k.name)}</div>
+        <div class="key-sub"><code>${esc(k.prefix)}…</code>${kind === "api" ? (k.scopes || []).map((s) => `<span class="kpill">${esc(s)}</span>`).join("") : ""}
+          <span title="Created ${esc(fmtDate(k.created))}">${k.last_used ? `Used ${esc(ago(k.last_used))}` : "Never used"}</span></div>
+      </div>
+      <button type="button" class="pill small danger-text" data-a="key-revoke" data-id="${esc(k.id)}" data-name="${esc(k.name)}">Revoke</button>
+    </div>`).join("");
 }
 
-function newKeyHtml() {
+function keyFormHtml(kind) {
+  const scopes = kind === "api"
+    ? `<div class="scope-chips" role="group" aria-label="Scopes">${KEY_SCOPES.map(([s, label]) => `<label class="scope-chip" title="${esc(label)}">
+        <input type="checkbox" id="ks-${s}" value="${s}" ${s === "request" ? "" : "checked"}><span><b>${s}</b> ${esc(label)}</span></label>`).join("")}</div>`
+    : "";
+  return `<div class="keyform">
+    <input id="key-name" maxlength="60" placeholder="${kind === "overlay" ? "Name, e.g. OBS stream" : "Name, e.g. Streamer.bot"}" spellcheck="false" autocomplete="off" aria-label="Name">
+    ${scopes}
+    <div class="keyform-actions"><button type="button" class="pill accent" data-a="key-create" data-kind="${kind}">Create</button>
+      <button type="button" class="pill" data-a="key-cancel">Cancel</button></div>
+  </div>`;
+}
+
+function newKeyHtml(kind) {
+  const tokenRow = `<div class="copy-row"><code id="nk-token" class="copy-text"></code><button type="button" class="pill small" data-a="copy" data-for="nk-token">${icon("content_copy")}Copy</button></div>`;
+  if (kind === "api") {
+    return `<div class="newkey" role="region" aria-label="New API key">
+      <div class="newkey-head"><b>${icon("key", "inline")} Copy this key now</b><span class="muted small">It won't be shown again</span></div>
+      ${tokenRow}
+      <div class="actions"><button type="button" class="pill" data-a="key-done">Done</button></div></div>`;
+  }
   const sel = (id, label, opts) => `<label class="ov-opt" for="${id}"><span>${label}</span><select id="${id}">${opts.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select></label>`;
-  return `<div class="newkey" role="region" aria-label="New key">
-    <div class="newkey-head"><b>${icon("key", "inline")} Copy this key now</b><span class="muted small">It won't be shown again</span></div>
-    <div class="copy-row"><code id="nk-token" class="copy-text"></code><button type="button" class="pill small" data-a="copy" data-for="nk-token">${icon("content_copy")}Copy</button></div>
-    <div class="flabel">Overlay URL</div>
+  return `<div class="newkey" role="region" aria-label="New overlay">
+    <div class="newkey-head"><b>${icon("cast", "inline")} Add this URL as a browser source</b><span class="muted small">The key in it won't be shown again</span></div>
     <div class="ov-opts">
       ${sel("ov-layout", "Layout", [["card", "Card"], ["bar", "Bar"], ["mini", "Mini"]])}
       ${sel("ov-pos", "Position", [["bl", "Bottom left"], ["br", "Bottom right"], ["tl", "Top left"], ["tr", "Top right"]])}
       ${sel("ov-progress", "Progress", [["1", "Show"], ["0", "Hide"]])}
       ${sel("ov-audio", "Audio", [["1", "Play here"], ["0", "Display only"]])}
       ${sel("ov-viz", "Visualizer", [["0", "Off"], ["1", "On"]])}
-      <label class="ov-opt" for="ov-name"><span>Name</span><input id="ov-name" type="text" maxlength="40" placeholder="Overlay" autocomplete="off"></label>
     </div>
-    <div class="copy-row"><code id="nk-url" class="copy-text"></code><button type="button" class="pill small" data-a="copy" data-for="nk-url">${icon("content_copy")}Copy</button></div>
-    <div id="nk-warn" class="small bad" hidden></div>
+    <div class="copy-row"><code id="nk-url" class="copy-text"></code><button type="button" class="pill small accent" data-a="copy" data-for="nk-url">${icon("content_copy")}Copy URL</button></div>
     <div class="actions"><button type="button" class="pill" data-a="key-done">Done</button></div>
   </div>`;
 }
 
 function updateOverlayURL() {
-  if (!newKey || !$("nk-url")) return;
+  if (newKey?.kind !== "overlay" || !$("nk-url")) return;
   const q = new URLSearchParams({ layout: $("ov-layout").value, pos: $("ov-pos").value });
   if ($("ov-progress").value === "0") q.set("progress", "0");
   if ($("ov-audio").value === "0") q.set("audio", "0");
   if ($("ov-viz").value === "1") q.set("viz", "1");
-  if ($("ov-name").value.trim()) q.set("name", $("ov-name").value.trim());
+  if (newKey.name) q.set("name", newKey.name);
   q.set("key", newKey.token);
   $("nk-url").textContent = `${location.origin}/overlay?${q}`;
-  const need = $("ov-audio").value === "1" ? ["speaker"] : ["read"]; // speaker includes read + song-end skip
-  const has = (s) => newKey.scopes.includes(s) || (s === "read" && newKey.scopes.includes("speaker"));
-  const missing = need.filter((s) => !has(s));
-  $("nk-warn").hidden = !missing.length;
-  $("nk-warn").textContent = missing.length ? `This key lacks: ${missing.join(", ")}` : "";
+}
+
+function openKeyForm(kind) {
+  dismissNewKey();
+  keyForm = keyForm === kind ? null : kind;
+  for (const k of ["overlay", "api"]) setHTML($(`${k}-form`), keyForm === k ? keyFormHtml(k) : "");
+  if (keyForm) $("key-name").focus();
 }
 
 async function createKey(btn) {
+  const kind = btn.dataset.kind;
   const name = $("key-name").value.trim();
-  const scopes = KEY_SCOPES.map(([s]) => s).filter((s) => $(`ks-${s}`).checked);
-  if (!name) { toast("Name the key"); $("key-name").focus(); return; }
-  if (!scopes.length) { toast("Pick at least one scope"); return; }
+  const scopes = kind === "api" ? KEY_SCOPES.map(([s]) => s).filter((s) => $(`ks-${s}`).checked) : [];
+  if (!name) { toast("Give it a name"); $("key-name").focus(); return; }
+  if (kind === "api" && !scopes.length) { toast("Pick at least one scope"); return; }
   busyBtn(btn, true);
   try {
-    const r = await api("/settings/keys", { name, scopes });
-    newKey = { token: r.token, scopes: r.key?.scopes || scopes };
-    $("key-new").innerHTML = newKeyHtml();
-    $("nk-token").textContent = r.token;
-    if (!newKey.scopes.includes("speaker")) $("ov-audio").value = "0";
+    const r = await api("/settings/keys", { name, kind, scopes });
+    keyForm = null;
+    setHTML($(`${kind}-form`), "");
+    newKey = { kind, token: r.token, name };
+    $(`${kind}-new`).innerHTML = newKeyHtml(kind);
+    if ($("nk-token")) $("nk-token").textContent = r.token;
     updateOverlayURL();
-    $("key-new").scrollIntoView({ block: "nearest", behavior: "smooth" });
+    $(`${kind}-new`).scrollIntoView({ block: "nearest", behavior: "smooth" });
     loadKeys();
   } catch (e) {
     toast(e.message);
+    busyBtn(btn, false);
   }
-  busyBtn(btn, false);
 }
 
 async function revokeKey(btn) {
   const { id, name } = btn.dataset;
-  const yes = await ask({ title: `Revoke “${name}”?`, text: "Anything using this key stops working.", ok: "Revoke", danger: true });
+  const yes = await ask({ title: `Revoke “${name}”?`, text: "Anything using it stops working right away.", ok: "Revoke", danger: true });
   if (!yes) return;
   try {
     await api(`/settings/keys/${enc(id)}`, undefined, "DELETE");
-    toast("Key revoked");
+    toast("Revoked");
   } catch (e) {
     toast(e.message);
   }
@@ -959,8 +1069,8 @@ async function revokeKey(btn) {
 }
 
 function dismissNewKey() {
+  if (newKey) setHTML($(`${newKey.kind}-new`), "");
   newKey = null;
-  $("key-new").innerHTML = "";
 }
 
 // navigator.clipboard needs a secure context; plain http on a LAN address falls back to execCommand.
@@ -1061,7 +1171,7 @@ function highlight() {
   for (const t of document.querySelectorAll("#view .tile[data-plid]")) t.classList.toggle("active", mode.playlist?.id === t.dataset.plid);
   const big = $("pl-big-play");
   if (big) {
-    const mine = mode.playlist?.id === route.id && playingNow();
+    const mine = mode.playlist?.id === (route.name === "liked" ? "liked" : route.id) && playingNow();
     setIcon(big, mine ? "pause" : "play_arrow");
     big.title = mine ? "Pause" : "Play";
     big.setAttribute("aria-label", big.title);
@@ -1073,7 +1183,7 @@ function renderSidebar() {
   const playing = S?.mode?.playlist?.id;
   setHTML($("sidebar-playlists"), playlists.map((p) => `<a href="#/playlist/${enc(p.id)}" class="lib-item" data-plid="${esc(p.id)}">
       ${playlistArt("lib-art", p)}
-      <span class="lib-meta"><span class="lib-name">${esc(p.name)}</span><span class="lib-sub">Playlist · ${p.count} song${p.count === 1 ? "" : "s"}</span></span>
+      <span class="lib-meta"><span class="lib-name">${esc(p.name)}${p.source === "ai" ? '<span class="tag">AI</span>' : ""}</span><span class="lib-sub">Playlist · ${p.count} song${p.count === 1 ? "" : "s"}</span></span>
       <span class="spk" title="Playing" aria-label="Playing">${icon("volume_up")}</span></a>`).join(""));
   for (const a of $("sidebar-playlists").children) {
     a.classList.toggle("playing", a.dataset.plid === playing);
@@ -1083,27 +1193,21 @@ function renderSidebar() {
 
 function trackSub(t) {
   const mode = S?.mode || {};
+  if (mode.playlist?.plus) return `Shuffle+ · ${mode.playlist.name}${t.library_id ? "" : " · new"}`;
   if (mode.playlist) {
     const pos = (t.playlist_pos ?? mode.playlist.position ?? 0) + 1;
-    return `Playlist · ${mode.playlist.name} ${pos}/${mode.playlist.count}`;
+    return `${mode.playlist.source === "ai" ? "AI playlist" : "Playlist"} · ${mode.playlist.name} ${pos}/${mode.playlist.count}`;
   }
   return t.genre ? genreLabel(t.genre) : "AI is choosing…";
 }
 
-function statusText(t) {
-  if (!t) return "";
-  if (t.status === "generating") return t.source && t.source !== "procedural" ? `Composing (asking ${t.source})…` : "Composing…";
-  if (t.status === "rendering") return "Rendering…";
-  if (t.status === "error") return t.error || "Something went wrong";
-  if (!out) return isRemote() ? "" : "Press play to listen";
-  if (out.cur?.id !== t.id && out.pending?.id !== t.id) return "Loading audio…";
-  return "";
-}
-
-function setStatus(text, error, busy) {
-  const el = $("np-status");
-  el.className = "np-status" + (error ? " error" : "");
-  setHTML(el, (busy ? '<span class="spin"></span>' : "") + esc(text));
+// No status line under the player; a failed song is reported once as a toast.
+let erroredId = null;
+function reportTrackError(t) {
+  if (t?.status === "error" && t.id !== erroredId) {
+    erroredId = t.id;
+    toast(t.error || "This song couldn't be made");
+  }
 }
 
 const REPEAT_NEXT = { off: "all", all: "one", one: "off" };
@@ -1156,9 +1260,7 @@ function renderPlayer() {
   $("np-name").textContent = now ? (now.name || (now.genre ? genreLabel(now.genre) : "AI is choosing…")) : "Nothing playing";
   $("np-sub").textContent = now ? trackSub(now) : "Pick a radio or a playlist";
   $("np-art").style.background = now ? gradient(now.hash || now.id) : "";
-  const st = statusText(now);
-  const busy = !!now && (now.status === "generating" || now.status === "rendering" || st === "Loading audio…");
-  setStatus(st, now?.status === "error", busy);
+  reportTrackError(now);
   const playing = playingNow();
   setIcon($("play"), playing ? "pause" : "play_arrow");
   $("play").title = playing ? "Pause (space)" : "Play (space)";
@@ -1175,16 +1277,44 @@ function renderPlayer() {
   $("download").disabled = !ready;
   $("skip").disabled = !now;
   const rep = S?.mode?.repeat || "off";
+  // Shuffle and repeat only mean something for a playlist (a radio never ends).
+  const mp = S?.mode?.playlist;
+  const sb = $("shuffle");
+  sb.classList.toggle("gone", !mp);
+  // Radios and Shuffle+ (a radio on the playlist) have no loop, previous or queue.
+  const radio = !mp || mp.plus;
+  $("repeat").classList.toggle("gone", radio);
+  $("prev").classList.toggle("gone", radio);
+  $("queue-link").hidden = radio;
+  if (mp) {
+    const sh = shuffleOf(mp.id);
+    setIcon(sb, sh === "auto" ? "auto_awesome" : "shuffle");
+    sb.classList.toggle("on", sh !== "off");
+    sb.title = SHUFFLE_TIP[sh];
+    sb.setAttribute("aria-label", SHUFFLE_TIP[sh]);
+  }
   const rb = $("repeat");
   setIcon(rb, rep === "one" ? "repeat_one" : "repeat");
   rb.classList.toggle("on", rep !== "off");
   rb.title = REPEAT_TIP[rep];
   rb.setAttribute("aria-label", REPEAT_TIP[rep]);
-  $("device").classList.toggle("on", !!sinkId);
-  const rem = isRemote();
-  $("remote").hidden = !rem;
-  if (rem) $("remote-text").textContent = live.speaker.kind === "overlay" ? "Playing on overlay" : "Playing on another tab";
+  renderDevice();
   renderVolume();
+}
+
+// The speaker button shows where the music plays: this tab (speaker icon), or another
+// player (cast icon + its name). Its menu moves playback ("Play on").
+function renderDevice() {
+  const rem = isRemote();
+  const sp = live.speaker;
+  const who = rem ? (live.clients.find((c) => c.client === sp.client)?.name || (sp.kind === "overlay" ? "Overlay" : "Another tab")) : "";
+  setIcon($("device-ico"), rem ? "cast" : "speaker");
+  $("device-label").hidden = !rem;
+  $("device-label").textContent = who;
+  $("device").classList.toggle("on", rem || !!sinkId);
+  $("device").classList.toggle("remote", rem);
+  $("device").title = rem ? `Playing on ${who}` : "Output device";
+  $("device").setAttribute("aria-label", rem ? `Playing on ${who}. Change output` : "Output device");
 }
 
 // As a remote the slider shows (and sets) the speaker's volume; this tab's own volume is kept.
@@ -1417,6 +1547,22 @@ async function mutate(fn, okMsg) {
   }
 }
 
+// Like Spotify: more than 3 s into a song, previous restarts it; otherwise it goes back one song.
+async function previous() {
+  const mp = S?.mode?.playlist;
+  if (!S?.now || !mp || mp.plus) return; // radios have no previous
+  const pos = out?.cur ? out.position() : isRemote() ? remotePos() : null;
+  if (pos && pos.t > 3) return seekTo(0);
+  try {
+    const r = await api("/previous", {});
+    if (!r.moved) return seekTo(0);
+    S = r;
+    afterState();
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
 async function togglePause() {
   if (!S?.now) return act(() => api("/random", {}));
   if (isRemote()) return control({ action: "toggle" });
@@ -1438,7 +1584,10 @@ async function setPaused(paused) {
 
 function playRow(m) {
   if (isPlaying(m) && hasPlayback()) return togglePause();
-  if (m.ctx === "pl") return act(() => api(`/playlists/${enc(m.plId)}/play`, { start: m.id }));
+  if (m.ctx === "pl") return playPlaylist(m.plId, m.id);
+  if (m.ctx === "queue") return act(() => api("/queue/jump", { pos: m.pos }));
+  if (m.ctx === "next") return act(() => api("/skip", { from_id: S?.now?.id, manual: true }));
+  if (m.ctx === "lib") return playPlaylist("liked", m.id);  // a liked song plays on through Liked songs
   // Persisted history may outlive its track id; prefer the saved song when there is one.
   const id = (m.ctx === "recent" && savedId(m)) || m.id;
   return act(() => api("/play", { id }));
@@ -1918,13 +2067,12 @@ function onClick(ev) {
     case "pl-play": {
       const id = el.dataset.pl;
       if (S?.mode?.playlist?.id === id && hasPlayback()) togglePause();
-      else act(() => api(`/playlists/${enc(id)}/play`, {}));
+      else playPlaylist(id);
       break;
     }
-    case "pl-shuffle": act(() => api(`/playlists/${enc(el.dataset.pl)}/play`, { shuffle: true })); break;
     case "pl-rename": renamePlaylist(el.dataset.pl); break;
     case "pl-delete": deletePlaylist(el.dataset.pl); break;
-    case "chip": liked.genre = el.dataset.genre; fillLiked(); highlight(); break;
+    case "pl-generate": generateMenu(el); break;
     case "app-save": saveApp(el); break;
     case "ai-save": saveAI(el); break;
     case "ai-test": testAI(el); break;
@@ -1938,6 +2086,8 @@ function onClick(ev) {
     case "key-create": createKey(el); break;
     case "key-revoke": revokeKey(el); break;
     case "key-done": dismissNewKey(); break;
+    case "key-new": openKeyForm(el.dataset.kind); break;
+    case "key-cancel": openKeyForm(keyForm); break;
     case "copy": {
       const src = $(el.dataset.for);
       if (src) copyText(src.textContent).then((ok) => toast(ok ? "Copied" : "Copy failed: select and copy it manually"));
@@ -1959,7 +2109,8 @@ function bind() {
   $("main").addEventListener("scroll", closeMenu, { passive: true });
 
   $("play").onclick = togglePause;
-  $("skip").onclick = () => S?.now && act(() => api("/skip", { from_id: S.now.id }));
+  $("skip").onclick = () => S?.now && act(() => api("/skip", { from_id: S.now.id, manual: true }));
+  $("prev").onclick = previous;
   $("like").onclick = () => S?.now && toggleLike(trackRow(S.now, "now"));
   $("add-now").onclick = (ev) => { ev.stopPropagation(); S?.now && toggleMenuFor($("add-now"), () => addMenu($("add-now"), trackRow(S.now, "now"))); };
   $("download").onclick = (ev) => {
@@ -1972,6 +2123,7 @@ function bind() {
       { label: "WAV (lossless, slower)", run: () => download(now.id, "wav") },
     ]));
   };
+  $("shuffle").onclick = () => { const mp = S?.mode?.playlist; if (mp) cycleShuffle(mp.id, mp.source === "ai"); };
   $("device").onclick = (ev) => { ev.stopPropagation(); if (menuAnchor === $("device") && !$("menu").hidden) closeMenu(); else deviceMenu($("device")); };
   $("repeat").onclick = () => {
     const next = REPEAT_NEXT[S?.mode?.repeat || "off"];
@@ -1986,17 +2138,13 @@ function bind() {
   $("volume").value = volume;
   $("volume").oninput = (e) => setVolume(parseFloat(e.target.value));
   $("mute").onclick = () => setVolume(shownVolume() > 0 ? 0 : unmuteTo);
-  $("play-here").onclick = playHere;
 
   // Liked view toolbar lives in the skeleton; only its results re-render.
   $("view").addEventListener("input", (ev) => {
-    if (ev.target.id === "liked-q") { liked.q = ev.target.value; fillLiked(); highlight(); }
-    if (ev.target.id === "ov-name") updateOverlayURL();
     const card = ev.target.closest?.(".settings-card");
     if (card) syncCard(card);
   });
   $("view").addEventListener("change", (ev) => {
-    if (ev.target.id === "liked-sort") { liked.sort = ev.target.value; fillLiked(); highlight(); }
     if (ev.target.id?.startsWith("ov-")) updateOverlayURL();
     const card = ev.target.closest?.(".settings-card");
     if (card) syncCard(card);
@@ -2027,6 +2175,7 @@ function bind() {
       ev.preventDefault();
       togglePause();
     } else if (ev.key === "n") $("skip").click();
+    else if (ev.key === "p") $("prev").click();
     else if (ev.key === "l") $("like").click();
     else if (ev.key === "/") {
       ev.preventDefault();

@@ -62,7 +62,8 @@ def test_play_playlist_in_order_and_wrap(client):
 
     client.post("/repeat", json={"mode": "all"})  # wrap around at the end
     s = client.post(f"/playlists/{pl['id']}/play", json={}).json()
-    assert s["mode"]["playlist"] == {"id": pl["id"], "name": "Set", "shuffle": False, "count": 3, "position": 0}
+    assert s["mode"]["playlist"] == {"id": pl["id"], "name": "Set", "source": None, "shuffle": False, "plus": False,
+                                      "count": 3, "position": 0}
     seen = []
     for _ in range(4):
         assert s["now"]["library_id"]  # rebuilt from the saved spec (cache hit here)

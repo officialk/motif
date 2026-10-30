@@ -159,6 +159,14 @@ function reconcile() {
   if (!now || now.status !== "ready") return;
   if (out.cur?.id === now.id || out.pending?.id === now.id || awaitingId) return;
   const buf = out.buffer(now.id);
+  if (buf && S.stopped) { // the playlist ended: first song cued, paused, until play is pressed
+    wantPaused = true;
+    out.playNow(now, buf);
+    out.pause().catch(() => {});
+    report();
+    render();
+    return;
+  }
   if (buf) { out.playNow(now, buf); return; }
   if (audioFail.id === now.id && Date.now() - audioFail.at < 5000) return;
   out.load(now).then(() => reconcile()).catch(() => { audioFail = { id: now.id, at: Date.now() }; });
@@ -181,6 +189,11 @@ function handOver() {
   if (isSpeaker() && (out.cur.id !== reportedId || (!wantPaused && Date.now() - lastReportAt > 10000))) report();
   if (!S || !S.now || S.now.id !== out.cur.id || out.pending || awaitingId) return;
   const next = S.up_next;
+  if (!next && S.at_end) { // last song of a playlist (repeat off): the server cues the first, paused
+    const pos = out.position();
+    if (pos && pos.t >= pos.music) confirmAdvance(out.cur.id, "end");
+    return;
+  }
   const buf = next && next.status === "ready" ? out.buffer(next.id) : null;
   if (!buf) return;
   const fromId = out.cur.id;

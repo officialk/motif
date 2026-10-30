@@ -674,6 +674,20 @@ def generate(genre: str, mood: str | None = None, seed: int | None = None,
                 prog = getattr(brief.instruments, role)
                 if prog is not None:
                     spec["instruments"][role] = prog
+        if brief.bass_style:
+            spec["bass_pattern"]["style"] = brief.bass_style
+        if brief.keys_style:
+            spec["keys_style"] = brief.keys_style
+        if brief.swing is not None:
+            spec["swing"] = round(brief.swing, 3)
+        if brief.drums is False:
+            spec["drum_pattern"], spec["drum_fill"] = {}, False
+            spec["instruments"]["drum_kit"] = None
+        elif brief.drums and not spec["drum_pattern"]:
+            # the genre has no drums by default: borrow a soft groove
+            spec["drum_pattern"] = {"kick": grid("X.......X......."), "rim": grid("....x.......x..."),
+                                    "closed_hat": grid("x.x.x.x.x.x.x.x.")}
+            spec["instruments"]["drum_kit"] = 0
     # Validate with a provisional long-enough structure, then size it to the target length.
     phrase_s = spec["bars"] * 4 * 60.0 / tempo
     spec["structure"] = scale_structure(spec["structure"], phrase_s, rng.uniform(*SONG_SECONDS))

@@ -1,8 +1,11 @@
 """Server-side radio state: now playing, prefetched next, history, play mode.
 
 Modes: one genre (a "radio"), shuffle (random radio each song), or a playlist
-(prompts create one; songs are re-rendered from their saved spec, in order or
-shuffled). Repeat: off | all (playlists wrap) | one (the same song again).
+(prompts create one; songs are re-rendered from their saved spec). A playlist is
+the queue: in order or shuffled, it stops at the end unless repeat is "all".
+Shuffle+ turns a playlist into a radio: each next song is either one of its songs
+or, at the "AI share of radio" rate, a new one made from its prompt (played, not saved).
+Repeat: off | all (playlists wrap) | one (the same song again); Shuffle+ ignores it.
 
 The browser does the actual playback; when a song's last bar ends it starts
 the prefetched one and tells the server (POST /skip with the id it was playing) and the server
@@ -46,7 +49,6 @@ class Track:
     library_id: Optional[str] = None  # set when the audio comes from the library
     display_name: Optional[str] = None  # library name (songs can be renamed)
     playlist_pos: Optional[int] = None  # position in the playing playlist's order
-    leaves_playlist: bool = False  # first radio song after a playlist ended (repeat off)
     ready_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def public(self) -> dict:
@@ -76,18 +78,24 @@ class Mode:
     repeat: str = "off"
     playlist_id: Optional[str] = None
     playlist_name: Optional[str] = None
+    playlist_source: Optional[str] = None  # "ai" for playlists the AI composed
     playlist_shuffle: bool = False
-    order: list[str] = field(default_factory=list)  # song ids in play order
+    playlist_plus: bool = False  # Shuffle+: a radio built on the playlist and its prompt
+    playlist_prompt: Optional[str] = None
+    order: list[str] = field(default_factory=list)  # song ids in play order (the queue)
+    bag: list[str] = field(default_factory=list)  # Shuffle+: playlist songs not yet played this round
 
     def leave_playlist(self) -> None:
         self.playlist_id, self.playlist_name, self.playlist_shuffle, self.order = None, None, False, []
+        self.playlist_source, self.playlist_plus, self.playlist_prompt, self.bag = None, False, None, []
 
     def public(self, now: "Track | None") -> dict:
         d = {"genre": self.genre, "shuffle": self.shuffle, "mood": self.mood, "repeat": self.repeat,
              "playlist": None}
         if self.playlist_id:
             d["playlist"] = {
-                "id": self.playlist_id, "name": self.playlist_name, "shuffle": self.playlist_shuffle,
+                "id": self.playlist_id, "name": self.playlist_name, "source": self.playlist_source,
+                "shuffle": self.playlist_shuffle, "plus": self.playlist_plus,
                 "count": len(self.order), "position": now.playlist_pos if now else None,
             }
         return d
@@ -112,6 +120,7 @@ class Player:
         # Live sync: every change bumps `version` and wakes the SSE streams waiting on `changed`.
         self.changed = threading.Condition(self.lock)
         self.version = 0
+        self.library_rev = 0  # bumped when songs/playlists change, so pages reload their library
         self.speaker: Optional[dict] = None  # {client, kind, since}: the one client that plays audio
         self.playback: Optional[dict] = None  # last report from the speaker
         self.command: Optional[dict] = None  # last remote command for the speaker
@@ -122,6 +131,7 @@ class Player:
         self.up_next: Optional[Track] = None
         self.history: deque[Track] = deque(maxlen=100)
         self.mode = Mode()
+        self.stopped = False  # a playlist ended: its first song is cued, paused, until play is pressed
         self._rng = random.Random()
 
     # --- commands -------------------------------------------------------
@@ -132,12 +142,14 @@ class Player:
         with self.lock:
             self.mode.leave_playlist()
             self.mode.genre, self.mode.shuffle, self.mode.mood = genre, False, mood
+            self.stopped = False
             self._replace_now(self._new_track(genre, mood, prefer_claude=bool(mood)))
 
     def play_random(self, mood: str | None = None) -> None:
         with self.lock:
             self.mode.leave_playlist()
             self.mode.shuffle, self.mode.mood = True, mood
+            self.stopped = False
             genre = self._pick_shuffle_genre()
             self.mode.genre = genre
             self._replace_now(self._new_track(genre, mood, prefer_claude=bool(mood)))
@@ -150,6 +162,7 @@ class Player:
             self.pool.submit(self._render_job, track)
             self.mode.leave_playlist()
             self.mode.genre, self.mode.shuffle = spec.genre, False
+            self.stopped = False
             self._replace_now(track)
             return track
 
@@ -161,37 +174,71 @@ class Player:
                 raise LookupError("unknown or unplayable song")
             self.mode.leave_playlist()
             self.mode.genre, self.mode.shuffle = track.genre, False
+            self.stopped = False
             self._replace_now(track)
             return track
 
-    def play_playlist(self, pl_id: str, start: str | None = None, shuffle: bool = False) -> Track:
+    def play_playlist(self, pl_id: str, start: str | None = None, shuffle: bool = False,
+                      plus: bool = False) -> Track:
+        """Play a playlist as the queue (in order, or shuffled). With plus: Shuffle+ (a radio on it)."""
         if self.library is None:
             raise LookupError("no library")
         pl = self.library.playlist(pl_id)
         if pl is None:
             raise LookupError("unknown playlist")
-        order = list(pl["song_ids"])
-        if not order:
+        ids = list(pl["song_ids"])
+        if not ids:
             raise ValueError("playlist is empty")
-        if shuffle:
-            self._rng.shuffle(order)
-        if start is not None:
-            if start not in order:
-                raise LookupError("song is not in this playlist")
-            if shuffle:  # start with the chosen song, shuffle the rest
-                order.remove(start)
-                order.insert(0, start)
+        if start is not None and start not in ids:
+            raise LookupError("song is not in this playlist")
         with self.lock:
             self.mode.playlist_id, self.mode.playlist_name = pl["id"], pl["name"]
-            self.mode.playlist_shuffle, self.mode.order = shuffle, order
+            self.mode.playlist_source, self.mode.playlist_prompt = pl.get("source"), pl.get("prompt")
             self.mode.shuffle, self.mode.mood = False, None
-            track = self._playlist_track(order.index(start) if start else 0)
+            self.stopped = False
+            self._arrange(ids, "auto" if plus else "on" if shuffle else "off", start)
+            if plus:
+                track = self._bag_track(first=start)
+            else:
+                track = self._playlist_track(self.mode.order.index(start) if start else 0)
             if track is None:
                 self.mode.leave_playlist()
                 raise ValueError("no playable songs in this playlist")
             self.mode.genre = track.genre
             self._replace_now(track)
             return track
+
+    def _arrange(self, ids: list[str], shuffle: str, current: Optional[str]) -> None:
+        """Set the queue for a shuffle mode; `current` (a song id) is the one playing or about to."""
+        self.mode.playlist_shuffle, self.mode.playlist_plus = shuffle != "off", shuffle == "auto"
+        rest = [i for i in ids if i != current]
+        if shuffle == "off":
+            self.mode.order = ids
+        else:
+            self._rng.shuffle(rest)
+            self.mode.order = ([current] if current in ids else []) + rest
+        self.mode.bag = list(rest) if shuffle == "auto" else []
+
+    def set_playlist_shuffle(self, pl_id: str, mode: str) -> None:
+        """Change the playing playlist's shuffle in place: "off", "on", or "auto" (Shuffle+).
+
+        The current song keeps playing; only what comes after it changes.
+        """
+        if mode not in ("off", "on", "auto"):
+            raise ValueError("shuffle must be off, on or auto")
+        with self.lock:
+            if self.mode.playlist_id != pl_id or self.library is None:
+                raise LookupError("this playlist is not playing")
+            pl = self.library.playlist(pl_id)
+            if pl is None:
+                raise LookupError("unknown playlist")
+            now = self.now_playing
+            current = now.library_id if now is not None else None
+            self._arrange(list(pl["song_ids"]), mode, current)
+            if now is not None:
+                now.playlist_pos = self.mode.order.index(current) if current in self.mode.order else None
+                self.up_next = self._make_next()
+            self._changed()
 
     def set_repeat(self, mode: str) -> None:
         if mode not in REPEAT_MODES:
@@ -203,18 +250,123 @@ class Player:
                 self.up_next = self._make_next()
             self._changed()
 
-    def skip(self, from_id: str | None = None) -> bool:
-        """Advance to the prefetched track. With from_id, only if that is still playing (no double skips)."""
+    def library_touched(self) -> None:
+        with self.lock:
+            self.library_rev += 1
+            self._changed()
+
+    def playlist_grew(self, pl_id: str, song_ids: list[str]) -> None:
+        """Songs were appended to a playlist: pages reload it, and if it is playing they join the queue."""
+        with self.lock:
+            self.library_rev += 1
+            if self.mode.playlist_id == pl_id:
+                new = [i for i in song_ids if i not in self.mode.order]
+                self.mode.order.extend(new)
+                if self.mode.playlist_plus:
+                    self.mode.bag.extend(new)
+                elif self.now_playing is not None and self.up_next is None:
+                    self.up_next = self._make_next()  # it was about to end: the new songs play instead
+            self._changed()
+
+    def skip(self, from_id: str | None = None, manual: bool = False) -> bool:
+        """Advance to the prefetched track. With from_id, only if that is still playing (no double skips).
+
+        At the end of a playlist (repeat off) it stops: the first song is cued, paused.
+        """
         with self.lock:
             if from_id and (self.now_playing is None or self.now_playing.id != from_id):
                 return False
             if self.now_playing is None and self.mode.genre is None:
                 return False
             nxt = self.up_next
+            pending = None
+            if (manual and self.mode.playlist_plus and nxt is not None and nxt.library_id is None
+                    and nxt.status != "ready"):
+                # Shuffle+ "next" while a new song is still being made: play one of the playlist's
+                # songs now and keep the new one for after it.
+                pending, nxt = nxt, self._bag_track()
             if nxt is None or nxt.status == "error":
                 nxt = self._make_next()
+            if nxt is None:
+                self._stop_at_start()
+                return True
+            self.stopped = False
             self._replace_now(nxt)
+            if pending is not None:
+                self.up_next = pending
+                self._changed()
             return True
+
+    def previous(self) -> bool:
+        """Back one song: the previous one in the queue, or (radio, Shuffle+) the last one played.
+
+        The page restarts the current song itself when it is more than a few seconds in.
+        Returns False when there is nothing before it.
+        """
+        with self.lock:
+            now = self.now_playing
+            if now is None:
+                return False
+            if self.mode.playlist_id and not self.mode.playlist_plus:
+                pos = now.playlist_pos if now.playlist_pos is not None else 0
+                if pos == 0 and self.mode.repeat != "all":
+                    return False
+                track = self._playlist_track((pos - 1) % len(self.mode.order))
+                if track is None:
+                    return False
+                self.stopped = False
+                self._replace_now(track, record=False)
+                return True
+            prev = next((t for t in reversed(self.history) if t.spec is not None), None)
+            if prev is None:
+                return False
+            self.history.remove(prev)
+            self.stopped = False
+            self._replace_now(self._again(prev), record=False)
+            if now.spec is not None:  # forward again returns to the song we left (if it was composed)
+                self.up_next = self._again(now)
+                self._changed()
+            return True
+
+    def jump(self, pos: int) -> bool:
+        """Play the queue from `pos` (a click on a song in the queue)."""
+        with self.lock:
+            if not self.mode.playlist_id or self.mode.playlist_plus or not 0 <= pos < len(self.mode.order):
+                return False
+            track = self._playlist_track(pos)
+            if track is None:
+                return False
+            self.stopped = False
+            self._replace_now(track)
+            return True
+
+    def queue(self) -> dict:
+        """The play list as one list with the current song at `current`.
+
+        A playlist (shuffle off/on) lists its whole queue in play order (`pos` per song, `repeats`
+        when it loops). A radio or Shuffle+ lists the songs played this session, the current one
+        and the next.
+        """
+        with self.lock:
+            now = self.now_playing
+            radio = not (self.mode.playlist_id and not self.mode.playlist_plus)
+            out = {"items": [], "current": None, "radio": radio,
+                   "repeats": not radio and self.mode.repeat == "all"}
+            if radio:
+                items = [t.public() for t in list(self.history)[-50:]]
+                if now is not None:
+                    out["current"] = len(items)
+                    items.append(now.public())
+                if self.up_next is not None:
+                    items.append(self.up_next.public())
+                out["items"] = items
+                return out
+            order = list(self.mode.order)
+            cur = now.playlist_pos if now is not None else None
+        entries = {i: self.library.get(i) for i in set(order)} if self.library is not None else {}
+        out["items"] = [{**entries[i], "pos": p} for p, i in enumerate(order) if entries.get(i)]
+        out["current"] = next((n for n, e in enumerate(out["items"]) if e["pos"] == cur), None)
+        return out
 
     def forget(self, spec_hash: str) -> bool:
         """Drop a deleted song from this session's history. True if it is playing or queued."""
@@ -237,7 +389,8 @@ class Player:
             return {
                 "now": now.public() if now else None,
                 "up_next": self.up_next.public() if self.up_next else None,
-                "history": [t.public() for t in reversed(self.history)],
+                # a playlist about to end (no next song), and one that ended (first song cued, paused)
+                "at_end": self.up_next is None and bool(self.mode.playlist_id), "stopped": self.stopped,
                 "mode": self.mode.public(now),
             }
 
@@ -265,6 +418,7 @@ class Player:
                        for cid, c in self.clients.items()]
             return {"version": self.version, "state": self.state(), "speaker": self.speaker,
                     "playback": self.playback, "command": self.command, "clients": clients,
+                    "library_rev": self.library_rev,
                     "server_time": time.time()}
 
     def connect_client(self, client: str, kind: str, name: Optional[str], audio: bool) -> None:
@@ -319,6 +473,9 @@ class Player:
         with self.lock:
             if not self.speaker or self.speaker["client"] != client:
                 return False
+            if self.stopped and state == "playing" and self.now_playing is not None \
+                    and track_id == self.now_playing.id:
+                self.stopped = False  # play was pressed after the playlist ended
             self.playback = {"client": client, "track_id": track_id, "state": state,
                              "position": max(0.0, float(position)), "at": time.time(),
                              "volume": min(max(float(volume), 0.0), 1.0)}
@@ -340,9 +497,9 @@ class Player:
 
     # --- internals --------------------------------------------------------
 
-    def _replace_now(self, track: Track) -> None:
+    def _replace_now(self, track: Track, record: bool = True) -> None:
         old = self.now_playing
-        if old is not None and old.status == "ready":
+        if record and old is not None and old.status == "ready":
             self.history.append(old)
             if self.on_history:
                 try:
@@ -350,28 +507,53 @@ class Player:
                 except Exception:
                     log.exception("history hook failed")
         self.now_playing = track
-        if track.leaves_playlist:
-            self.mode.leave_playlist()
         # Prefetch: as soon as a song is chosen, start on the next one.
         self.up_next = self._make_next()
         self._prune()
         self._changed()
 
-    def _make_next(self) -> Track:
+    def _stop_at_start(self) -> None:
+        """The playlist ended (repeat off): cue its first song, paused, like a finished album."""
+        track = self._playlist_track(0)
+        if track is None:
+            return
+        self.stopped = True
+        self._replace_now(track)
+
+    def _make_next(self) -> Optional[Track]:
         now = self.now_playing
+        if self.mode.playlist_id and self.mode.playlist_plus:
+            return self._plus_next()
         if self.mode.repeat == "one" and now is not None and now.spec is not None:
             return self._again(now)
         if self.mode.playlist_id:
             pos = now.playlist_pos if now and now.playlist_pos is not None else -1
             if pos + 1 < len(self.mode.order) or self.mode.repeat == "all":
-                track = self._playlist_track(pos + 1)
+                return self._playlist_track(pos + 1)
+            return None  # end of the playlist: it stops
+        return self._new_track(self._next_genre(), self.mode.mood)
+
+    def _plus_next(self) -> Optional[Track]:
+        """Shuffle+: a new song from the playlist's prompt (AI share of radio), else one of its songs."""
+        if self.claude_ratio > 0 and self._rng.random() < self.claude_ratio:
+            return self._new_track(None, self.mode.playlist_prompt or self.mode.playlist_name, prefer_claude=True)
+        return self._bag_track()
+
+    def _bag_track(self, first: Optional[str] = None) -> Optional[Track]:
+        """Shuffle+: the next playlist song in a shuffled round; a new round starts when it runs out."""
+        if first is not None:
+            track = self._library_track(first)
+            if track is not None:
+                return track
+        for _ in range(2):
+            while self.mode.bag:
+                track = self._library_track(self.mode.bag.pop(0))
                 if track is not None:
                     return track
-            # End of the playlist (repeat off): the radio carries on; the mode switches when it starts.
-            track = self._new_track(self._next_genre(), None)
-            track.leaves_playlist = True
-            return track
-        return self._new_track(self._next_genre(), self.mode.mood)
+            now = self.now_playing.library_id if self.now_playing else None
+            self.mode.bag = [i for i in self.mode.order if i != now] or list(self.mode.order)
+            self._rng.shuffle(self.mode.bag)
+        return None
 
     def _again(self, track: Track) -> Track:
         """The same song once more (repeat one); audio comes from the cache."""

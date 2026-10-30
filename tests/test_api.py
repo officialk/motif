@@ -9,10 +9,12 @@ def test_genre_renders_now_and_prefetches_next(client):
     wait_ready(client, now["id"])
     wait_ready(client, nxt["id"])
 
-    now = client.get("/now").json()["now"]
+    now = client.get("/state").json()["now"]
     assert now["status"] == "ready" and now["tempo"] > 0
     assert now["music_seconds"] < now["duration"] and now["sections"][0]["start"] == 0
-    assert client.get("/queue").json()["up_next"]["status"] == "ready"
+    q = client.get("/queue").json()  # a radio: the current song and the next
+    assert q["radio"] is True and q["items"][q["current"]]["id"] == now["id"]
+    assert q["items"][-1]["status"] == "ready"
 
     mp3 = client.get(now["mp3"])
     assert mp3.status_code == 200 and mp3.headers["content-type"] == "audio/mpeg"
@@ -39,8 +41,9 @@ def test_random_mode_changes_genre(client):
 
 
 def test_bad_input(client):
-    assert client.post("/genre", json={"genre": "polka"}).status_code == 400
+    assert client.post("/genre", json={"genre": "polka"}).status_code == 422  # not one of /genres
     assert client.post("/loop", json={"count": 3}).status_code in (404, 405)  # loop control removed
+    assert client.get("/now").status_code in (404, 405)  # merged into /state
     assert client.get("/audio/nope.mp3").status_code == 404
     assert client.get("/audio/nope.ogg").status_code == 404
 
@@ -67,12 +70,12 @@ def test_startup_cues_last_played_or_a_random_radio(client):
     s = client.get("/state").json()
     assert s["now"] is not None and s["mode"]["genre"] in client.get("/genres").json()["genres"]
     wait_ready(client, s["now"]["id"])
-    first = client.get("/now").json()["now"]
+    first = client.get("/state").json()["now"]
     client.post("/skip", json={"from_id": first["id"]})  # first song goes to history
 
     last = client.get("/history").json()["history"][0]["hash"]
     cue_startup_song(client.player, client.library)  # now: the last played song again
-    again = client.get("/now").json()["now"]
+    again = client.get("/state").json()["now"]
     assert again["hash"] == last
     assert again["id"] != first["id"]
 

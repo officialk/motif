@@ -52,7 +52,9 @@ _TYPES = {
     "postgres": {"float": "DOUBLE PRECISION", "autoid": "BIGSERIAL PRIMARY KEY", "blob": "BYTEA"},
 }
 # Columns added after the first release: (table, column, definition).
-_ADDED_COLUMNS = (("songs", "liked", "INTEGER NOT NULL DEFAULT 1"), ("history", "hash", "TEXT"))
+_ADDED_COLUMNS = (("songs", "liked", "INTEGER NOT NULL DEFAULT 1"), ("history", "hash", "TEXT"),
+                  ("playlists", "source", "TEXT"), ("playlists", "prompt", "TEXT"),
+                  ("api_keys", "kind", "TEXT NOT NULL DEFAULT 'api'"))
 
 
 def schema(dialect: str) -> list[str]:

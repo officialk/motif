@@ -8,7 +8,7 @@ from tests.conftest import wait_ready
 def play_one(client, genre="chiptune"):
     s = client.post("/genre", json={"genre": genre}).json()
     wait_ready(client, s["now"]["id"])
-    return client.get("/now").json()["now"]
+    return client.get("/state").json()["now"]
 
 
 def test_like_stores_seed_and_spec_not_audio(client):
@@ -38,7 +38,7 @@ def test_download_renders_on_server(client):
         assert r.status_code == 200 and r.content.startswith(magic)
         assert f".{fmt}" in r.headers["content-disposition"]
     assert client.post(f"/download/{now['id']}", json={"format": "wav"}).status_code == 200  # by track id
-    assert client.post("/export/" + entry["id"], json={"format": "mp3"}).status_code == 200  # old path
+    assert client.post("/export/" + entry["id"], json={"format": "mp3"}).status_code in (404, 405)  # old path gone
     assert client.post("/download/0123456789abcdef", json={"format": "mp3"}).status_code == 404
 
 
@@ -101,7 +101,6 @@ def test_delete_song_removes_seed_playlists_history_and_audio(client):
     assert client.get("/library").json()["library"] == []
     assert client.get(f"/playlists/{pl['id']}").json()["playlist"]["count"] == 0
     assert all(h["hash"] != entry["id"] for h in client.get("/history").json()["history"])
-    assert all(t["hash"] != entry["id"] for t in client.get("/state").json()["history"])
     client.player.pool.submit(lambda: None).result()  # let the cache cleanup run
     assert not mp3.exists()
     assert client.delete(f"/songs/{entry['id']}").status_code == 404

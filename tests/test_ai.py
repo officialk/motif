@@ -51,14 +51,15 @@ def test_valid_reply_used(fake_backend):
     fake_backend(reply="Here you go:\n```json\n" + good_reply() + "\n```")
     spec, source = make_spec("jazz", "smoky", True)
     assert source == "claude" and spec.name == "AI Test Tune"
-    assert spec.key == "D" and spec.scale == "dorian" and spec.instruments.lead == 65 and spec.seed == 99
+    assert spec.key == "D" and spec.scale == "dorian" and spec.instruments.lead == 65
+    assert spec.seed != 99  # the server picks the seed, never the AI
 
 
 def test_requested_genre_wins_and_values_clamped(fake_backend):
     fake_backend(reply=good_reply(genre="jazz", tempo=999, energy=5, density=-3, seed=2**40))
     spec, source = make_spec("techno", None, True)
     assert source == "claude"
-    assert spec.genre == "techno" and spec.tempo == 136 and spec.seed == 2**31 - 1
+    assert spec.genre == "techno" and spec.tempo == 136 and 0 <= spec.seed < 2**31
 
 
 @pytest.mark.parametrize("reply", [
@@ -312,3 +313,32 @@ def test_playlist_falls_back_to_procedural_when_ai_fails(monkeypatch):
     assert title == "Slow piano for reading" and len(songs) == 5
     assert {s.genre for s, _ in songs} == {"classical-piano"} and {src for _, src in songs} == {"procedural"}
     assert len({s.audio_hash() for s, _ in songs}) == 5
+
+
+
+def test_seed_is_never_the_ais_and_not_asked_for(fake_backend):
+    calls = fake_backend(reply=good_reply(seed=7))
+    seeds = {make_spec("jazz", None, True)[0].seed for _ in range(5)}
+    assert 7 not in seeds and len(seeds) == 5  # fresh random seed each time
+    assert '"seed"' not in calls[0][0].split("CONSTRAINTS")[0]  # not in the schema shown to the AI
+
+
+def test_per_song_mood_and_styles_reach_the_song(fake_backend):
+    import json as _json
+    reply = {"title": "Rain Walk", "songs": [
+        {"genre": "jazz", "mood": "late-night tenor sax", "bass_style": "walking", "keys_style": "comp", "swing": 0.35},
+        {"genre": "ambient", "mood": "slow rain on glass", "drums": False},
+        {"genre": "lofi", "mood": "soft flute", "drums": True},
+    ]}
+    fake_backend(reply=_json.dumps(reply))
+    ai.set_settings(settings("claude-cli"))
+    try:
+        title, songs = ai.make_playlist(None, "rainy evening", 3)
+    finally:
+        ai.set_settings(ai.AISettings.from_config())
+    specs = [s for s, _ in songs]
+    assert title == "Rain Walk" and [s.genre for s in specs] == ["jazz", "ambient", "lofi"]
+    assert specs[0].instruments.lead == 66  # "tenor sax" from that song's own mood
+    assert specs[0].bass_pattern.style == "walking" and specs[0].keys_style == "comp" and specs[0].swing == 0.35
+    assert specs[1].instruments.drum_kit is None and specs[1].drum_pattern == {}
+    assert specs[2].instruments.lead == 73  # flute
