@@ -159,7 +159,8 @@ class Conn:
         self.dialect = dialect
 
     def _sql(self, sql: str) -> str:
-        return sql.replace("?", "%s") if self.dialect == "postgres" else sql
+        # psycopg treats % as a placeholder marker, so literal % (LIKE patterns) must be doubled.
+        return sql.replace("%", "%%").replace("?", "%s") if self.dialect == "postgres" else sql
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> Cursor:
         cur = self.raw.cursor()
