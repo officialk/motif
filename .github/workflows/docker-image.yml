@@ -1,6 +1,7 @@
-# Builds the Docker image. Not active yet: it only runs when started by hand
-# (Actions tab -> "Docker image" -> Run workflow). To enable automatic builds,
-# uncomment the push / pull_request triggers below.
+# Builds the Docker image.
+# - pull requests to main: build only (a check that the image still builds)
+# - pushes to main and v* tags: build and publish to ghcr.io/<owner>/<repo>
+# - manual run (Actions -> "Docker image" -> Run workflow): build, publish if ticked
 name: Docker image
 
 on:
@@ -10,11 +11,11 @@ on:
         description: "Also push the image to ghcr.io"
         type: boolean
         default: false
-  # push:
-  #   branches: [main]
-  #   tags: ["v*"]
-  # pull_request:
-  #   branches: [main]
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -33,7 +34,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
-        if: ${{ inputs.publish }}
+        if: ${{ github.event_name == 'push' || inputs.publish }}
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -46,6 +47,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=sha
@@ -54,7 +56,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ inputs.publish == true }}
+          push: ${{ github.event_name == 'push' || inputs.publish == true }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
