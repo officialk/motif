@@ -48,6 +48,7 @@ _PROGRAM_NAMES = {
     66: "tenor sax", 71: "clarinet", 73: "flute", 80: "square lead", 81: "saw lead", 88: "new age pad",
     89: "warm pad", 94: "halo pad", 7: "clavinet", 22: "harmonica", 27: "clean electric guitar", 36: "slap bass",
     40: "violin", 43: "contrabass", 60: "french horn", 61: "brass section", 68: "oboe",
+    104: "sitar", 105: "banjo", 106: "shamisen (tumbi-like pluck)", 111: "shehnai",
 }
 
 

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Motif overlay</title>
+  <link rel="stylesheet" href="/overlay.css">
+</head>
+<body>
+  <div id="ov" class="ov layout-card pos-bl idle">
+    <div id="card" class="ov-card">
+      <div id="art" class="ov-art">
+        <span class="ov-art-ico" data-icon="music_note"></span>
+        <span class="ov-paused" data-icon="pause"></span>
+        <span class="ov-eq" aria-hidden="true"><i></i><i></i><i></i></span>
+        <canvas id="viz" class="ov-viz" aria-hidden="true" hidden></canvas>
+      </div>
+      <div id="body" class="ov-body">
+        <div id="name" class="ov-name">Nothing playing</div>
+        <div id="line" class="ov-line"></div>
+        <div id="req" class="ov-req" hidden></div>
+        <div id="progress" class="ov-progress">
+          <div class="ov-track"><div id="fill" class="ov-fill"></div></div>
+          <div class="ov-times"><span id="t-cur">0:00</span><span id="t-total">0:00</span></div>
+        </div>
+      </div>
+      <div id="badge" class="ov-badge" hidden></div>
+    </div>
+  </div>
+  <script src="/icons.js"></script>
+  <script src="/audio.js"></script>
+  <script src="/overlay.js"></script>
+</body>
+</html>

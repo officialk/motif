@@ -14,7 +14,7 @@ const fmtLong = (s) => {
 };
 const fmtSize = (b) => (b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round((b || 0) / 1024))} KB`);
 const fmtDate = (t) => (t ? new Date(t * 1000).toLocaleString() : "");
-const genreLabel = (g) => String(g ?? "").replace(/[-_]/g, " ");
+const genreLabel = (g) => { const s = String(g ?? "").replace(/[-_]/g, " "); return s.charAt(0).toUpperCase() + s.slice(1); };
 const scaleLabel = (s) => String(s ?? "").replace(/_/g, " ");
 const enc = encodeURIComponent;
 
@@ -83,174 +83,11 @@ function setHTML(el, html) {
   return true;
 }
 
-// ---------- audio output: Web Audio (gapless hand-over) ----------
-// Each song plays once. The next song starts exactly when the current song's last
-// bar ends (music_seconds); the old song's reverb ring-out overlaps the new start.
-class WebAudioOut {
-  constructor() {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    this.gapless = true;
-    this.ctx = new Ctx();
-    this.master = this.ctx.createGain();
-    this.master.connect(this.ctx.destination);
-    this.loading = new Map(); // id -> Promise<AudioBuffer>
-    this.ready = new Map();   // id -> AudioBuffer
-    this.cur = null;          // { id, src, gain, start, music, track }
-    this.pending = null;      // the next song, scheduled to start when the current one's music ends
-  }
-
-  static sinkSupported() {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    return !!Ctx && typeof Ctx.prototype.setSinkId === "function";
-  }
-
-  setSink(id) { return this.ctx.setSinkId(id || ""); }
-
-  load(track) {
-    if (!this.loading.has(track.id)) {
-      const p = fetch(track.mp3)
-        .then((r) => { if (!r.ok) throw new Error(`audio ${r.status}`); return r.arrayBuffer(); })
-        .then((b) => this.ctx.decodeAudioData(b))
-        .then((buf) => { this.ready.set(track.id, buf); return buf; });
-      p.catch(() => this.loading.delete(track.id));
-      this.loading.set(track.id, p);
-      this._trim(track.id);
-    }
-    return this.loading.get(track.id);
-  }
-
-  buffer(id) { return this.ready.get(id) || null; }
-
-  // A decoded 5-minute song is ~100 MB; keep only what is playing or about to.
-  _trim(keepId) {
-    const keep = new Set([keepId, this.cur?.id, this.pending?.id]);
-    for (const id of [...this.loading.keys()]) {
-      if (this.loading.size <= 3) break;
-      if (!keep.has(id)) { this.loading.delete(id); this.ready.delete(id); }
-    }
-  }
-
-  // `start` is when the song's 0:00 is (or would have been) on the context clock, so
-  // position = currentTime - start holds after a seek too.
-  _voice(track, buf, when, offset = 0) {
-    const src = this.ctx.createBufferSource();
-    src.buffer = buf;
-    const gain = this.ctx.createGain();
-    src.connect(gain);
-    gain.connect(this.master);
-    src.start(when, offset);
-    const music = Math.min(track.music_seconds || buf.duration, buf.duration);
-    return { id: track.id, src, gain, start: when - offset, music, track };
-  }
-
-  // Jump within the current song: restart its buffer at `t` with a very short crossfade.
-  // The prefetched next song is unscheduled; tick() schedules it again for the new end.
-  seek(t) {
-    const c = this.cur;
-    if (!c) return;
-    const buf = c.src.buffer;
-    t = Math.max(0, Math.min(t, buf.duration - 0.05));
-    this.cancelPending();
-    const now = this.ctx.currentTime + 0.02;
-    const g = c.gain.gain;
-    g.cancelScheduledValues(now);
-    g.setValueAtTime(g.value, now);
-    g.linearRampToValueAtTime(0, now + 0.03);
-    c.src.stop(now + 0.04);
-    const v = this._voice(c.track, buf, now, t);
-    v.gain.gain.setValueAtTime(0, now);
-    v.gain.gain.linearRampToValueAtTime(1, now + 0.03);
-    this.cur = v;
-  }
-
-  // Immediate switch (user action): short fade-out of the old song.
-  playNow(track, buf) {
-    const t = this.ctx.currentTime + 0.03;
-    this.cancelPending();
-    if (this.cur) {
-      const g = this.cur.gain.gain;
-      g.cancelScheduledValues(t);
-      g.setValueAtTime(g.value, t);
-      g.linearRampToValueAtTime(0, t + 0.4);
-      this.cur.src.stop(t + 0.45);
-    }
-    const v = this._voice(track, buf, t);
-    v.gain.gain.setValueAtTime(0, t);
-    v.gain.gain.linearRampToValueAtTime(1, t + 0.01);
-    this.cur = v;
-  }
-
-  // Sample-accurate start of the next song; the current one keeps ringing out on its own.
-  scheduleAt(track, buf, when) {
-    this.pending = this._voice(track, buf, when);
-  }
-
-  // Called every tick: promote the pending voice once its start time has passed.
-  promote() {
-    if (this.pending && this.ctx.currentTime >= this.pending.start) {
-      this.cur = this.pending;
-      this.pending = null;
-      return true;
-    }
-    return false;
-  }
-
-  cancelPending() {
-    if (this.pending) {
-      try { this.pending.src.stop(); } catch { /* not started */ }
-      this.pending = null;
-    }
-  }
-
-  position() {
-    if (!this.cur) return null;
-    return { t: Math.max(0, this.ctx.currentTime - this.cur.start), music: this.cur.music, track: this.cur.track };
-  }
-
-  musicEnd() { return this.cur.start + this.cur.music; }
-  now() { return this.ctx.currentTime; }
-  setVolume(v) { this.master.gain.setTargetAtTime(v, this.ctx.currentTime, 0.02); }
-  pause() { return this.ctx.suspend(); }
-  resume() { return this.ctx.resume(); }
-  get paused() { return this.ctx.state !== "running"; }
-}
-
-// ---------- audio output: <audio> fallback (small gap between songs) ----------
-class ElementOut {
-  constructor() {
-    this.gapless = false;
-    this.el = new Audio();
-    this.ready = new Map();
-    this.cur = null;
-    this.pending = null;
-  }
-  static sinkSupported() { return typeof HTMLMediaElement !== "undefined" && typeof HTMLMediaElement.prototype.setSinkId === "function"; }
-  setSink(id) { return this.el.setSinkId(id || ""); }
-  load(track) { this.ready.set(track.id, track.mp3); return Promise.resolve(track.mp3); }
-  buffer(id) { return this.ready.get(id) || null; }
-  playNow(track, url) {
-    this.el.src = url;
-    this.el.play().catch(() => {});
-    this.cur = { id: track.id, music: track.music_seconds, start: 0, track };
-  }
-  promote() { return false; }
-  cancelPending() {}
-  seek(t) { if (this.cur) this.el.currentTime = Math.max(0, t); }
-  position() {
-    if (!this.cur) return null;
-    return { t: this.el.currentTime, music: this.cur.music, track: this.cur.track };
-  }
-  setVolume(v) { this.el.volume = v; }
-  pause() { this.el.pause(); return Promise.resolve(); }
-  resume() { return this.el.play(); }
-  get paused() { return this.el.paused; }
-}
-
-const OutClass = (window.AudioContext || window.webkitAudioContext) ? WebAudioOut : ElementOut;
+// Audio engines (WebAudioOut / ElementOut / OutClass), clientId() and streamEvents() live in audio.js.
 
 // ---------- app state ----------
 let S = null;               // last server state
-let out = null;             // audio output
+let out = null;             // audio output (only while this tab is, or is becoming, the speaker)
 let awaitingId = null;      // local auto-advance waiting for the server to confirm
 let wantPaused = false;
 let volume = store.get("volume", 0.8);
@@ -264,11 +101,44 @@ const plDetail = new Map(); // playlist id -> {playlist with songs, updated}
 let recent = [];            // GET /history
 let settings = null;
 let backups = null;         // {enabled, backups}
+let apiKeys = null;         // GET /settings/keys: {keys} | {error}
 let audioFail = { id: null, at: 0 };
 const liked = { q: "", genre: "", sort: "newest" };
 const models = new Map();   // row key -> row model (for event delegation)
 let route = { name: "home" };
 let mountedRoute = "";
+
+// ---------- live sync: speaker / remote ----------
+// Exactly one client plays audio: the speaker. This tab is the speaker, a remote (another
+// client plays; we mirror its progress and send /control), or idle (nobody plays).
+const CLIENT = clientId();
+const live = {
+  up: false,         // SSE stream connected
+  version: null,     // newest event version taken (reset per connection)
+  speaker: null,     // {client, kind, since}
+  playback: null,    // speaker report {client, track_id, state, position, at, volume}
+  offset: 0,         // server clock − local clock, seconds
+  lastSeq: null,     // highest command seq seen (null = adopt on next event)
+  claiming: 0,       // claims in flight: don't let older events overrule them
+  claimSince: 0,     // `since` of our last successful claim
+  clients: [],       // connected pages/overlays [{client, kind, name, audio, since}]
+};
+let autoClaimAt = 0;
+let reportedId = null, lastReportAt = 0, reportSoon = null;
+let resumeAt = null;        // {id, t}: "Play here" continues where the other speaker was
+let fallbackTimer = null;   // slow /state poll while the stream is down
+
+const isSpeaker = () => !!live.speaker && live.speaker.client === CLIENT;
+const isRemote = () => !!live.speaker && live.speaker.client !== CLIENT;
+const serverNow = () => Date.now() / 1000 + live.offset;
+// The speaker's report, if it belongs to the current speaker.
+const remotePlayback = () => (live.playback && live.speaker && live.playback.client === live.speaker.client ? live.playback : null);
+// Something is playing (or paused mid-song) somewhere: here or on the speaker.
+const hasPlayback = () => !!(out?.cur || (isRemote() && remotePlayback()));
+function playingNow() {
+  if (isRemote()) return remotePlayback()?.state === "playing";
+  return !!(out && out.cur && !wantPaused);
+}
 
 function ensureOut() {
   if (!out) {
@@ -279,6 +149,149 @@ function ensureOut() {
   if (!wantPaused && out.paused && out.cur) out.resume();
   if (out.ctx && out.ctx.state === "suspended" && !wantPaused) out.ctx.resume();
   return out;
+}
+
+// The user asked for music in this tab. Plays here unless another client is the speaker.
+// Audio is created synchronously so the browser counts the click as the autoplay gesture.
+function wantLocal() {
+  if (isRemote()) return false;
+  ensureOut();
+  if (!isSpeaker()) claimSpeaker(false);
+  return true;
+}
+
+async function claimSpeaker(force) {
+  live.claiming++;
+  try {
+    const r = await api("/speaker/claim", { client: CLIENT, kind: "site", force: !!force });
+    live.speaker = r.speaker || null;
+    if (isSpeaker()) { live.claimSince = r.speaker.since || serverNow(); reportedId = null; }
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    live.claiming--;
+  }
+  applyRole();
+  return isSpeaker();
+}
+
+// React to the current speaker: a remote never holds audio.
+function applyRole() {
+  if (live.claiming) return;
+  if (isRemote()) {
+    if (out) stopLocal();
+  } else if (!live.speaker && out?.cur && live.up && Date.now() - autoClaimAt > 5000) {
+    // Our stream dropped and the server released us, but this tab still has the song: take it back.
+    autoClaimAt = Date.now();
+    claimSpeaker(false);
+  }
+}
+
+function stopLocal() {
+  if (!out) return;
+  out.destroy();
+  out = null;
+  awaitingId = null;
+  reportedId = null;
+  resumeAt = null;
+  renderProgress(null);
+  renderPlayer();
+  highlight();
+}
+
+async function playHere() {
+  const pos = remotePos();
+  resumeAt = pos ? { id: pos.track.id, t: pos.t } : null;
+  wantPaused = false;
+  ensureOut();
+  if (await claimSpeaker(true)) reconcile();
+  else stopLocal();
+  renderPlayer();
+}
+
+function onLive(type, d) {
+  if (type !== "state" || !d || typeof d !== "object") return;
+  if (live.version !== null && typeof d.version === "number" && d.version <= live.version) return;
+  if (typeof d.version === "number") live.version = d.version;
+  if (typeof d.server_time === "number") live.offset = d.server_time - Date.now() / 1000;
+  const sp = d.speaker || null;
+  // An event older than our own claim can still say someone else is the speaker; ignore that.
+  const stale = !!out && !!sp && sp.client !== CLIENT && (sp.since || 0) < live.claimSince;
+  if (!live.claiming && !stale) live.speaker = sp;
+  live.playback = d.playback || null;
+  live.clients = Array.isArray(d.clients) ? d.clients : [];
+  const cmd = d.command;
+  const seq = cmd && typeof cmd.seq === "number" ? cmd.seq : 0;
+  if (live.lastSeq === null) live.lastSeq = seq; // first event on this connection: never replay old commands
+  else if (seq > live.lastSeq) {
+    live.lastSeq = seq;
+    if (isSpeaker()) runCommand(cmd);
+  }
+  applyRole();
+  if (d.state) { S = d.state; afterState(); } else renderPlayer();
+}
+
+function onLiveStatus(status) {
+  if (status === "open") {
+    live.up = true;
+    live.version = null;
+    live.lastSeq = null;
+    clearInterval(fallbackTimer);
+    fallbackTimer = null;
+  } else if (status === "down") {
+    live.up = false;
+    if (!fallbackTimer) fallbackTimer = setInterval(refresh, 5000);
+  }
+}
+
+// Commands from remotes, executed by the speaker only.
+async function runCommand(c) {
+  if (!out) return;
+  switch (c.action) {
+    case "pause": if (!wantPaused) await setPaused(true); break;
+    case "resume": if (wantPaused || out.paused) await setPaused(false); break;
+    case "toggle": await setPaused(!!(out.cur && !wantPaused)); break;
+    case "seek": if (typeof c.t === "number") seekTo(c.t); break;
+    case "volume": if (typeof c.volume === "number") setVolume(c.volume); break;
+  }
+}
+
+async function control(body) {
+  try {
+    await api("/control", body);
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+// Tell remotes what the speaker is doing. tick() also calls this on song change and every 10 s.
+function report() {
+  clearTimeout(reportSoon);
+  if (!out?.cur || !isSpeaker()) return;
+  const pos = out.position();
+  reportedId = out.cur.id;
+  lastReportAt = Date.now();
+  api("/playback", {
+    client: CLIENT, track_id: out.cur.id, state: wantPaused ? "paused" : "playing",
+    position: pos ? Math.min(pos.t, pos.music) : 0, volume,
+  }).catch(() => {});
+}
+
+// Progress of the remote speaker, extrapolated with the server clock.
+function remotePos() {
+  const pb = remotePlayback();
+  if (!pb) return null;
+  const track = [S?.now, S?.up_next].find((x) => x && x.id === pb.track_id);
+  const music = track?.music_seconds;
+  if (!music) return null;
+  const since = pb.state === "playing" && typeof pb.at === "number" ? Math.max(0, serverNow() - pb.at) : 0;
+  return { t: Math.max(0, (pb.position || 0) + since), music, track };
+}
+
+// What the progress bar shows: local audio, or the remote speaker.
+function progressPos() {
+  if (out?.cur) return out.position();
+  return isRemote() ? remotePos() : null;
 }
 
 async function refresh() {
@@ -312,7 +325,12 @@ function reconcile() {
   if (!now || now.status !== "ready") return;
   if (out.cur?.id === now.id || out.pending?.id === now.id || awaitingId) return;
   const buf = out.buffer(now.id);
-  if (buf) { out.playNow(now, buf); return; }
+  if (buf) {
+    out.playNow(now, buf);
+    if (resumeAt?.id === now.id && resumeAt.t > 1) out.seek(Math.min(resumeAt.t, (now.music_seconds || resumeAt.t) - 1));
+    resumeAt = null;
+    return;
+  }
   // Only chain when the buffer is not ready yet; chaining unconditionally loops forever.
   if (audioFail.id === now.id && Date.now() - audioFail.at < 5000) return;
   out.load(now).then(() => reconcile()).catch((e) => {
@@ -334,9 +352,11 @@ async function confirmAdvance(fromId, newId) {
 }
 
 // Start the prefetched song exactly when the current song's last bar ends.
+// Only the speaker has `out`, so only the speaker hands over and calls /skip.
 function tick() {
-  if (!out || !out.cur) return renderProgress(null);
+  if (!out || !out.cur) return renderProgress(isRemote() ? remotePos() : null);
   if (out.promote()) return;
+  if (isSpeaker() && (out.cur.id !== reportedId || (!wantPaused && Date.now() - lastReportAt > 10000))) report();
   const pos = out.position();
   renderProgress(pos);
   if (!S || !S.now || S.now.id !== out.cur.id || out.pending || awaitingId) return;
@@ -350,9 +370,11 @@ function tick() {
     if (end - t > 2) return;
     out.scheduleAt(next, buf, Math.max(end, t + 0.05));
     // The pending voice is promoted in tick(); tell the server right when it starts.
+    const o = out;
     const wait = setInterval(() => {
-      if (out.cur?.id === next.id) { clearInterval(wait); confirmAdvance(fromId, next.id); }
-      else if (out.pending?.id !== next.id) clearInterval(wait); // cancelled by a user action
+      if (out !== o) clearInterval(wait); // audio was stopped (lost the speaker role)
+      else if (o.cur?.id === next.id) { clearInterval(wait); confirmAdvance(fromId, next.id); }
+      else if (o.pending?.id !== next.id) clearInterval(wait); // cancelled by a user action
     }, 50);
   } else if (pos.t >= pos.music) {
     out.playNow(next, buf);
@@ -406,6 +428,16 @@ async function loadSettings() {
   }
   backups = null;
   if (settings?.storage?.enabled) loadBackups();
+  loadKeys();
+  if (route.name === "settings") renderView();
+}
+
+async function loadKeys() {
+  try {
+    apiKeys = await api("/settings/keys");
+  } catch (e) {
+    apiKeys = { error: e.message };
+  }
   if (route.name === "settings") renderView();
 }
 
@@ -471,7 +503,6 @@ function rowHtml(m, i) {
   const k = `data-m="${esc(key)}"`;
   const isLiked = !!savedId(m);
   const tag = m.source && m.source !== "procedural" ? `<span class="tag">${esc(m.source)}</span>` : "";
-  const keyCell = m.tempo != null ? `${esc(m.key)} ${esc(scaleLabel(m.scale))} · ${Math.round(m.tempo)} bpm` : "";
   const sub = [m.genre ? esc(genreLabel(m.genre)) : "", m.showStatus ? statusBadge(m.status) : ""].filter(Boolean).join(" ");
   const ready = !m.tid || m.status === "ready";
   const moves = m.ctx === "pl"
@@ -481,7 +512,6 @@ function rowHtml(m, i) {
   return `<div class="row" ${k} data-hash="${esc(m.hash || "")}" data-tid="${esc(m.tid || "")}" data-pl="${esc(m.plId || "")}">
   <div class="num"><span class="n">${i + 1}</span><span class="eq" aria-hidden="true">${icon("equalizer")}</span><button class="p" data-a="row-play" ${k} title="Play" aria-label="Play ${esc(m.name)}" ${ready ? "" : "disabled"}>${icon("play_arrow")}</button></div>
   <div class="song"><div class="art" ${artStyle(m.hash || m.id)}></div><div class="meta"><div class="title">${esc(m.name)}${tag}</div><div class="sub">${sub}</div></div></div>
-  <div class="cell">${keyCell}</div>
   <div class="cell">${m.seconds ? fmtTime(m.seconds) : ""}</div>
   <div class="acts">${moves}<button class="icon-btn like${isLiked ? " on" : ""}" data-a="row-like" ${k} title="${isLiked ? "Remove from Liked songs" : "Like"}" aria-label="${isLiked ? "Remove from Liked songs" : "Like"}" aria-pressed="${isLiked}" ${ready ? "" : "disabled"}>${icon(isLiked ? "favorite" : "favorite_border")}</button><button class="icon-btn add" data-a="row-add" ${k} title="Add to playlist" aria-label="Add to playlist" ${ready ? "" : "disabled"}>${icon("add")}</button><button class="icon-btn del" data-a="row-delete" ${k} title="Delete song" aria-label="Delete ${esc(m.name)}" ${ready ? "" : "disabled"}>${icon("delete")}</button><button class="icon-btn" data-a="row-more" ${k} title="More" aria-label="More">${icon("more_horiz")}</button></div>
 </div>`;
@@ -489,7 +519,7 @@ function rowHtml(m, i) {
 
 function rowsHtml(list, cls = "") {
   if (!list.length) return "";
-  return `<div class="rows ${cls}"><div class="row-head"><span>#</span><span>Title</span><span>Key · tempo</span><span title="Length" aria-label="Length">${icon("schedule")}</span><span></span></div>${list.map(rowHtml).join("")}</div>`;
+  return `<div class="rows ${cls}"><div class="row-head"><span>#</span><span>Title</span><span title="Length" aria-label="Length">${icon("schedule")}</span><span></span></div>${list.map(rowHtml).join("")}</div>`;
 }
 
 // ---------- routing / views ----------
@@ -570,7 +600,7 @@ function skeleton(r) {
       return `<div id="v-pl-hero"></div><div id="v-pl-actions" class="actions"></div><div id="v-pl-rows"></div>`;
     case "settings":
       return `<h1>Settings</h1>
-        <div id="v-ai"></div><div id="v-storage"></div><div id="v-backups"></div>`;
+        <div id="v-app"></div><div id="v-ai"></div><div id="v-storage"></div><div id="v-backups"></div><div id="v-keys"></div>`;
   }
   return "";
 }
@@ -719,6 +749,22 @@ function switchHtml(id, label, on) {
   return `<label class="switch" for="${id}"><input type="checkbox" role="switch" id="${id}" ${on ? "checked" : ""}><span class="track" aria-hidden="true"></span><span>${esc(label)}</span></label>`;
 }
 
+// App defaults (stored on the server, so every device gets them).
+function appCardHtml(a) {
+  const opt = (id, label, opts, val) => `<div class="field"><label for="${id}">${esc(label)}</label><select id="${id}">${
+    opts.map(([v, l]) => `<option value="${esc(v)}" ${v === val ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></div>`;
+  const startup = [["last", "Last played song"], ["random", "Random radio"],
+    ...genres.map((g) => [`genre:${g}`, `${genreLabel(g)} radio`]), ["none", "Nothing"]];
+  return `<section class="card settings-card" id="app-card" aria-labelledby="app-h">
+    ${cardHead("app-h", "App")}
+    ${opt("app-startup", "On startup", startup, a.startup || "last")}
+    ${opt("app-repeat", "Repeat", [["off", "Off"], ["all", "All"], ["one", "One"]], a.repeat || "off")}
+    ${textField("app-prompt-count", "Songs per prompt", a.prompt_count ?? 8, "8", "", "number", 'min="2" max="20" step="1" inputmode="numeric"')}
+    <div class="field"><span class="flabel">Visualizer</span>${switchHtml("app-visualizer", "Show above the player", a.visualizer !== false)}</div>
+    <div class="actions"><button type="button" class="pill accent" data-a="app-save">Save</button></div>
+  </section>`;
+}
+
 function aiCardHtml(ai) {
   const d = ai.defaults || {};
   const keys = ai.keys || {};
@@ -792,15 +838,148 @@ function backupsHtml(st) {
 }
 
 function fillSettings() {
+  if (!$("keys-card")) setHTML($("v-keys"), keysCardHtml());
+  setHTML($("keys-list"), keysListHtml());
   if (!settings || settings.error) {
+    setHTML($("v-app"), "");
     setHTML($("v-ai"), settings ? `<div class="empty">Could not load settings: ${esc(settings.error)}</div>` : '<div class="empty">Loading settings…</div>');
     setHTML($("v-storage"), "");
     setHTML($("v-backups"), "");
     return;
   }
+  if (setHTML($("v-app"), appCardHtml(settings.app || {}))) initCard($("app-card"));
   if (setHTML($("v-ai"), aiCardHtml(settings.ai || {}))) initCard($("ai-card"));
   if (setHTML($("v-storage"), storageCardHtml(settings.storage || {}))) initCard($("st-card"));
   setHTML($("v-backups"), backupsHtml(settings.storage || {}));
+}
+
+// ---------- API keys ----------
+// The token is shown once, right after creating; the server only keeps a hash.
+const KEY_SCOPES = [
+  ["read", "See what's playing"],
+  ["control", "Play, pause, skip, pick music"],
+  ["request", "Make playlists from prompts"],
+  ["speaker", "Play the audio (overlay)"],
+];
+let newKey = null; // {token, scopes} until "Done"
+
+function keysCardHtml() {
+  const scopes = KEY_SCOPES.map(([s, label]) => `<label class="scope" for="ks-${s}"><input type="checkbox" id="ks-${s}" value="${s}" ${s === "request" ? "" : "checked"}>
+      <span class="scope-name">${s}</span><span class="scope-label">${esc(label)}</span></label>`).join("");
+  return `<section class="card" id="keys-card" aria-labelledby="keys-h">
+    <div class="card-head"><h2 id="keys-h">API keys</h2></div>
+    <div id="keys-list"></div>
+    <div id="key-new"></div>
+    <h3 class="sub-h">New key</h3>
+    <div class="field"><label for="key-name">Name</label><input id="key-name" maxlength="60" value="Overlay" spellcheck="false" autocomplete="off"></div>
+    <div class="field"><span class="flabel">Scopes</span><div class="scopes" role="group" aria-label="Scopes">${scopes}</div></div>
+    <div class="actions"><button type="button" class="pill accent" data-a="key-create">${icon("key")}Create key</button></div>
+  </section>`;
+}
+
+function keysListHtml() {
+  if (!apiKeys) return '<div class="empty">Loading keys…</div>';
+  if (apiKeys.error) return `<div class="empty">Could not load keys: ${esc(apiKeys.error)}</div>`;
+  if (!apiKeys.keys?.length) return '<div class="empty">No keys yet.</div>';
+  return apiKeys.keys.map((k) => `<div class="apikey"><div class="meta">
+      <div class="apikey-name">${esc(k.name)} <code>${esc(k.prefix)}…</code></div>
+      <div class="chips-row">${(k.scopes || []).map((s) => `<span class="kpill">${esc(s)}</span>`).join("")}</div>
+      <div class="muted small">Created ${esc(fmtDate(k.created))} · ${k.last_used ? `last used ${esc(fmtDate(k.last_used))}` : "never used"}</div></div>
+    <button type="button" class="pill small" data-a="key-revoke" data-id="${esc(k.id)}" data-name="${esc(k.name)}">Revoke</button></div>`).join("");
+}
+
+function newKeyHtml() {
+  const sel = (id, label, opts) => `<label class="ov-opt" for="${id}"><span>${label}</span><select id="${id}">${opts.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select></label>`;
+  return `<div class="newkey" role="region" aria-label="New key">
+    <div class="newkey-head"><b>${icon("key", "inline")} Copy this key now</b><span class="muted small">It won't be shown again</span></div>
+    <div class="copy-row"><code id="nk-token" class="copy-text"></code><button type="button" class="pill small" data-a="copy" data-for="nk-token">${icon("content_copy")}Copy</button></div>
+    <div class="flabel">Overlay URL</div>
+    <div class="ov-opts">
+      ${sel("ov-layout", "Layout", [["card", "Card"], ["bar", "Bar"], ["mini", "Mini"]])}
+      ${sel("ov-pos", "Position", [["bl", "Bottom left"], ["br", "Bottom right"], ["tl", "Top left"], ["tr", "Top right"]])}
+      ${sel("ov-progress", "Progress", [["1", "Show"], ["0", "Hide"]])}
+      ${sel("ov-audio", "Audio", [["1", "Play here"], ["0", "Display only"]])}
+      ${sel("ov-viz", "Visualizer", [["0", "Off"], ["1", "On"]])}
+      <label class="ov-opt" for="ov-name"><span>Name</span><input id="ov-name" type="text" maxlength="40" placeholder="Overlay" autocomplete="off"></label>
+    </div>
+    <div class="copy-row"><code id="nk-url" class="copy-text"></code><button type="button" class="pill small" data-a="copy" data-for="nk-url">${icon("content_copy")}Copy</button></div>
+    <div id="nk-warn" class="small bad" hidden></div>
+    <div class="actions"><button type="button" class="pill" data-a="key-done">Done</button></div>
+  </div>`;
+}
+
+function updateOverlayURL() {
+  if (!newKey || !$("nk-url")) return;
+  const q = new URLSearchParams({ layout: $("ov-layout").value, pos: $("ov-pos").value });
+  if ($("ov-progress").value === "0") q.set("progress", "0");
+  if ($("ov-audio").value === "0") q.set("audio", "0");
+  if ($("ov-viz").value === "1") q.set("viz", "1");
+  if ($("ov-name").value.trim()) q.set("name", $("ov-name").value.trim());
+  q.set("key", newKey.token);
+  $("nk-url").textContent = `${location.origin}/overlay?${q}`;
+  const need = $("ov-audio").value === "1" ? ["speaker"] : ["read"]; // speaker includes read + song-end skip
+  const has = (s) => newKey.scopes.includes(s) || (s === "read" && newKey.scopes.includes("speaker"));
+  const missing = need.filter((s) => !has(s));
+  $("nk-warn").hidden = !missing.length;
+  $("nk-warn").textContent = missing.length ? `This key lacks: ${missing.join(", ")}` : "";
+}
+
+async function createKey(btn) {
+  const name = $("key-name").value.trim();
+  const scopes = KEY_SCOPES.map(([s]) => s).filter((s) => $(`ks-${s}`).checked);
+  if (!name) { toast("Name the key"); $("key-name").focus(); return; }
+  if (!scopes.length) { toast("Pick at least one scope"); return; }
+  busyBtn(btn, true);
+  try {
+    const r = await api("/settings/keys", { name, scopes });
+    newKey = { token: r.token, scopes: r.key?.scopes || scopes };
+    $("key-new").innerHTML = newKeyHtml();
+    $("nk-token").textContent = r.token;
+    if (!newKey.scopes.includes("speaker")) $("ov-audio").value = "0";
+    updateOverlayURL();
+    $("key-new").scrollIntoView({ block: "nearest", behavior: "smooth" });
+    loadKeys();
+  } catch (e) {
+    toast(e.message);
+  }
+  busyBtn(btn, false);
+}
+
+async function revokeKey(btn) {
+  const { id, name } = btn.dataset;
+  const yes = await ask({ title: `Revoke “${name}”?`, text: "Anything using this key stops working.", ok: "Revoke", danger: true });
+  if (!yes) return;
+  try {
+    await api(`/settings/keys/${enc(id)}`, undefined, "DELETE");
+    toast("Key revoked");
+  } catch (e) {
+    toast(e.message);
+  }
+  loadKeys();
+}
+
+function dismissNewKey() {
+  newKey = null;
+  $("key-new").innerHTML = "";
+}
+
+// navigator.clipboard needs a secure context; plain http on a LAN address falls back to execCommand.
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.cssText = "position:fixed;opacity:0;top:0;left:0";
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch { /* unsupported */ }
+    ta.remove();
+    return ok;
+  }
 }
 
 // ---------- settings form state ----------
@@ -815,7 +994,7 @@ function formValues(card) {
 }
 const secretsTyped = (card) => [...card.querySelectorAll("[data-secret]")].some((i) => i.value !== "");
 const isDirty = (card) => !!card && (formValues(card) !== card._base || secretsTyped(card));
-const settingsDirty = () => isDirty($("ai-card")) || isDirty($("st-card"));
+const settingsDirty = () => isDirty($("app-card")) || isDirty($("ai-card")) || isDirty($("st-card"));
 
 function snapshotForm(card) {
   const s = {};
@@ -856,6 +1035,7 @@ function syncCard(card) {
   card.classList.toggle("is-dirty", dirty);
   card.querySelector(".dirty").hidden = !dirty;
   const test = card.querySelector("[data-test]");
+  if (!test) return;
   const off = card.id === "st-card" && !settings?.storage?.enabled;
   test.disabled = dirty || off;
   test.title = dirty ? "Save first" : off ? "Turn S3 on and save first" : "";
@@ -881,7 +1061,7 @@ function highlight() {
   for (const t of document.querySelectorAll("#view .tile[data-plid]")) t.classList.toggle("active", mode.playlist?.id === t.dataset.plid);
   const big = $("pl-big-play");
   if (big) {
-    const mine = mode.playlist?.id === route.id && out?.cur && !wantPaused;
+    const mine = mode.playlist?.id === route.id && playingNow();
     setIcon(big, mine ? "pause" : "play_arrow");
     big.title = mine ? "Pause" : "Play";
     big.setAttribute("aria-label", big.title);
@@ -907,8 +1087,7 @@ function trackSub(t) {
     const pos = (t.playlist_pos ?? mode.playlist.position ?? 0) + 1;
     return `Playlist · ${mode.playlist.name} ${pos}/${mode.playlist.count}`;
   }
-  if (t.tempo == null) return t.genre ? genreLabel(t.genre) : "AI is choosing…";
-  return `${genreLabel(t.genre)} · ${Math.round(t.tempo)} bpm · ${t.key} ${scaleLabel(t.scale)}`;
+  return t.genre ? genreLabel(t.genre) : "AI is choosing…";
 }
 
 function statusText(t) {
@@ -916,7 +1095,7 @@ function statusText(t) {
   if (t.status === "generating") return t.source && t.source !== "procedural" ? `Composing (asking ${t.source})…` : "Composing…";
   if (t.status === "rendering") return "Rendering…";
   if (t.status === "error") return t.error || "Something went wrong";
-  if (!out) return "Press play to listen";
+  if (!out) return isRemote() ? "" : "Press play to listen";
   if (out.cur?.id !== t.id && out.pending?.id !== t.id) return "Loading audio…";
   return "";
 }
@@ -930,6 +1109,48 @@ function setStatus(text, error, busy) {
 const REPEAT_NEXT = { off: "all", all: "one", one: "off" };
 const REPEAT_TIP = { off: "Repeat: off", all: "Repeat: all (playlist / radio keeps going)", one: "Repeat: this song" };
 
+// ---------- visualizer above the player ----------
+let appPrefs = { visualizer: true };
+async function loadAppPrefs() {
+  try { appPrefs = (await api("/settings")).app || appPrefs; } catch { /* keep defaults */ }
+}
+
+// Live spectrum from this tab's own audio. When an overlay plays, there's nothing here to analyse.
+const PVIZ_BARS = 96;
+const PVIZ_HALF = PVIZ_BARS / 2; // mirrored around the centre: bass in the middle, highs to the sides
+let pvizLevels = new Array(PVIZ_HALF).fill(0);
+function drawPlayerViz() {
+  requestAnimationFrame(drawPlayerViz);
+  const c = $("player-viz");
+  const live = appPrefs.visualizer !== false && out && out.analyser && out.cur && !wantPaused && !out.paused;
+  const target = live ? out.levels(PVIZ_HALF) : null;
+  if (!out) pvizLevels.fill(0); // audio moved elsewhere (overlay) or stopped: no fade-out needed
+  if (!target && pvizLevels.every((v) => v < 0.005)) { if (!c.hidden) c.hidden = true; return; }
+  c.hidden = false;
+  const w = c.clientWidth, h = c.clientHeight, dpr = window.devicePixelRatio || 1;
+  if (c.width !== Math.round(w * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+  const g = c.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  pvizLevels = pvizLevels.map((v, i) => { const t = target ? target[i] : 0; return v + (t - v) * (t > v ? 0.55 : 0.12); });
+  // Bars stand on the top edge of the player area and grow upward only, mirrored from the centre.
+  const gap = 3, bw = (w - gap * (PVIZ_BARS - 1)) / PVIZ_BARS, center = PVIZ_HALF;
+  const grad = g.createLinearGradient(0, h, 0, 0);
+  grad.addColorStop(0, "rgba(126, 224, 181, .75)");
+  grad.addColorStop(1, "rgba(138, 180, 255, .15)");
+  g.fillStyle = grad;
+  const r = Math.min(3, bw / 2);
+  for (let i = 0; i < PVIZ_HALF; i++) {
+    const bh = pvizLevels[i] * (h - 2);
+    if (bh < 0.5) continue;
+    for (const slot of [center + i, center - 1 - i]) { // right and left of the centre
+      g.beginPath();
+      g.roundRect ? g.roundRect(slot * (bw + gap), h - bh, bw, bh, [r, r, 0, 0]) : g.rect(slot * (bw + gap), h - bh, bw, bh);
+      g.fill();
+    }
+  }
+}
+
 function renderPlayer() {
   const now = S?.now;
   $("np-name").textContent = now ? (now.name || (now.genre ? genreLabel(now.genre) : "AI is choosing…")) : "Nothing playing";
@@ -938,7 +1159,7 @@ function renderPlayer() {
   const st = statusText(now);
   const busy = !!now && (now.status === "generating" || now.status === "rendering" || st === "Loading audio…");
   setStatus(st, now?.status === "error", busy);
-  const playing = !!(out && out.cur && !wantPaused);
+  const playing = playingNow();
   setIcon($("play"), playing ? "pause" : "play_arrow");
   $("play").title = playing ? "Pause (space)" : "Play (space)";
   $("play").setAttribute("aria-label", playing ? "Pause" : "Play");
@@ -960,33 +1181,58 @@ function renderPlayer() {
   rb.title = REPEAT_TIP[rep];
   rb.setAttribute("aria-label", REPEAT_TIP[rep]);
   $("device").classList.toggle("on", !!sinkId);
+  const rem = isRemote();
+  $("remote").hidden = !rem;
+  if (rem) $("remote-text").textContent = live.speaker.kind === "overlay" ? "Playing on overlay" : "Playing on another tab";
   renderVolume();
 }
 
+// As a remote the slider shows (and sets) the speaker's volume; this tab's own volume is kept.
+const remoteVol = { v: null, at: 0 }; // last value this remote sent
+function shownVolume() {
+  if (!isRemote()) return volume;
+  const pb = remotePlayback();
+  if (remoteVol.v !== null && (Date.now() - remoteVol.at < 1500 || typeof pb?.volume !== "number")) return remoteVol.v;
+  return typeof pb?.volume === "number" ? pb.volume : volume;
+}
+
 function renderVolume() {
-  const muted = volume <= 0;
+  const v = shownVolume();
+  const muted = v <= 0;
+  if (Number($("volume").value) !== v) $("volume").value = v;
   setIcon($("mute"), muted ? "volume_off" : "volume_up");
   $("mute").title = muted ? "Unmute" : "Mute";
   $("mute").setAttribute("aria-label", muted ? "Unmute" : "Mute");
 }
 
 let unmuteTo = volume > 0 ? volume : 0.8;
+let volTimer = null, volQueued = null;
+function sendVolume(v) {
+  if (volTimer) { volQueued = v; return; }
+  control({ action: "volume", volume: v });
+  volTimer = setTimeout(() => {
+    volTimer = null;
+    if (volQueued !== null) { const q = volQueued; volQueued = null; sendVolume(q); }
+  }, 200);
+}
+
 function setVolume(v) {
-  volume = Math.max(0, Math.min(1, v));
-  if (volume > 0) unmuteTo = volume;
+  v = Math.max(0, Math.min(1, v));
+  if (v > 0) unmuteTo = v;
+  if (isRemote()) {
+    remoteVol.v = v;
+    remoteVol.at = Date.now();
+    sendVolume(v);
+    renderVolume();
+    return;
+  }
+  volume = v;
   store.set("volume", volume);
-  $("volume").value = volume;
   if (out) out.setVolume(volume);
   renderVolume();
+  if (isSpeaker()) { clearTimeout(reportSoon); reportSoon = setTimeout(report, 300); }
 }
 
-function currentSection(sections, t) {
-  let cur = null;
-  for (const sec of sections || []) if (sec.start <= t) cur = sec;
-  return cur;
-}
-
-let marksFor = null;
 // ---------- seeking ----------
 let seekDrag = null; // fraction 0..1 while the pointer is down on the progress bar
 
@@ -996,42 +1242,53 @@ function seekFraction(ev) {
 }
 
 function seekTo(t) {
+  if (!out?.cur && isRemote()) {
+    const pos = remotePos();
+    if (!pos) return;
+    t = Math.max(0, Math.min(t, pos.music));
+    live.playback = { ...live.playback, position: t, at: serverNow() }; // shown until the speaker reports
+    control({ action: "seek", t });
+    renderProgress(remotePos());
+    return;
+  }
   if (!out?.cur) return;
   out.seek(Math.max(0, Math.min(t, out.cur.music)));
   renderProgress(out.position());
+  report();
 }
 
 function bindSeek() {
   const bar = $("seek");
   bar.onpointerdown = (ev) => {
-    if (!out?.cur || ev.button !== 0) return;
+    if (!progressPos() || ev.button !== 0) return;
     ev.preventDefault();
     bar.setPointerCapture(ev.pointerId);
     bar.classList.add("dragging");
     seekDrag = seekFraction(ev);
-    renderProgress(out.position());
+    renderProgress(progressPos());
   };
   bar.onpointermove = (ev) => {
     if (seekDrag === null) return;
     seekDrag = seekFraction(ev);
-    renderProgress(out.position());
+    renderProgress(progressPos());
   };
   const finish = (ev, apply) => {
     if (seekDrag === null) return;
     const f = apply ? seekFraction(ev) : null;
     seekDrag = null;
     bar.classList.remove("dragging");
-    if (f !== null) seekTo(f * out.cur.music);
+    const pos = progressPos();
+    if (f !== null && pos) seekTo(f * pos.music);
   };
   bar.onpointerup = (ev) => finish(ev, true);
   bar.onpointercancel = (ev) => finish(ev, false);
   bar.onkeydown = (ev) => {
-    if (!out?.cur) return;
-    const t = out.position().t;
+    const pos = progressPos();
+    if (!pos) return;
     const step = { ArrowLeft: -5, ArrowRight: 5, PageDown: -30, PageUp: 30 }[ev.key];
-    if (step !== undefined) seekTo(t + step);
+    if (step !== undefined) seekTo(pos.t + step);
     else if (ev.key === "Home") seekTo(0);
-    else if (ev.key === "End") seekTo(out.cur.music - 1);
+    else if (ev.key === "End") seekTo(pos.music - 1);
     else return;
     ev.preventDefault();
     ev.stopPropagation();
@@ -1044,10 +1301,8 @@ function renderProgress(pos) {
     $("seek-knob").style.left = "0";
     $("seek").setAttribute("aria-valuemax", "0");
     $("seek").setAttribute("aria-valuenow", "0");
-    $("section").textContent = "";
     $("t-cur").textContent = "0:00";
     $("t-total").textContent = S?.now?.music_seconds ? fmtTime(S.now.music_seconds) : "0:00";
-    if (marksFor !== null) { $("section-marks").innerHTML = ""; marksFor = null; }
     return;
   }
   const { music, track } = pos;
@@ -1058,15 +1313,8 @@ function renderProgress(pos) {
   $("seek").setAttribute("aria-valuemax", String(Math.round(music)));
   $("seek").setAttribute("aria-valuenow", String(Math.round(Math.min(t, music))));
   $("seek").setAttribute("aria-valuetext", `${fmtTime(Math.min(t, music))} of ${fmtTime(music)}`);
-  const sec = t < music ? currentSection(track.sections, t) : null;
-  $("section").textContent = sec ? sec.kind : t >= music ? "ending" : "";
   $("t-cur").textContent = fmtTime(Math.min(t, music));
   $("t-total").textContent = fmtTime(music);
-  if (marksFor !== track.id) {
-    marksFor = track.id;
-    $("section-marks").innerHTML = (track.sections || []).slice(1)
-      .map((s) => `<span style="left:${(100 * Number(s.start)) / music}%"></span>`).join("");
-  }
 }
 
 
@@ -1143,12 +1391,14 @@ function ask({ title, text = "", value, ok = "OK", danger = false }) {
 }
 
 // ---------- actions ----------
+// Choosing music means "play": here if this tab is (or can become) the speaker, else on the speaker.
 async function act(fn) {
-  wantPaused = false; // choosing music means "play"
-  ensureOut();
+  wantPaused = false;
+  const local = wantLocal();
   try {
     S = await fn();
     afterState();
+    if (!local && remotePlayback()?.state === "paused") control({ action: "resume" });
   } catch (e) {
     toast(e.message);
   }
@@ -1168,22 +1418,26 @@ async function mutate(fn, okMsg) {
 }
 
 async function togglePause() {
-  ensureOut();
   if (!S?.now) return act(() => api("/random", {}));
-  if (out.cur && !wantPaused) {
-    wantPaused = true;
-    await out.pause();
-  } else {
-    wantPaused = false;
-    await out.resume();
-    reconcile();
-  }
+  if (isRemote()) return control({ action: "toggle" });
+  wantLocal();
+  await setPaused(!!(out.cur && !wantPaused));
+}
+
+async function setPaused(paused) {
+  if (!out) return;
+  wantPaused = paused;
+  try {
+    await (paused ? out.pause() : out.resume());
+  } catch { /* blocked by the browser until a click */ }
+  if (!paused) reconcile();
+  report();
   renderPlayer();
   highlight();
 }
 
 function playRow(m) {
-  if (isPlaying(m) && out?.cur) return togglePause();
+  if (isPlaying(m) && hasPlayback()) return togglePause();
   if (m.ctx === "pl") return act(() => api(`/playlists/${enc(m.plId)}/play`, { start: m.id }));
   // Persisted history may outlive its track id; prefer the saved song when there is one.
   const id = (m.ctx === "recent" && savedId(m)) || m.id;
@@ -1353,11 +1607,12 @@ async function sendPrompt(text) {
   if (!text || prompting) return;
   setPromptBusy(true);
   wantPaused = false;
-  ensureOut();
+  const local = wantLocal();
   try {
     const r = await api("/prompt", { text });
     const pl = r.playlist;
     S = r;
+    if (!local && remotePlayback()?.state === "paused") control({ action: "resume" });
     $("prompt").value = "";
     if (pl?.songs) plDetail.set(pl.id, pl);
     afterState();
@@ -1385,13 +1640,27 @@ async function listOutputs() {
   }
 }
 
+// Where the music plays: this tab or a connected overlay (only one plays at a time).
+function playOnItems() {
+  const overlays = live.clients.filter((c) => c.kind === "overlay" && c.audio !== false && c.client !== CLIENT);
+  const items = [{ heading: "Play on" },
+    { label: "This tab", checked: live.speaker?.client === CLIENT, run: () => { if (live.speaker?.client !== CLIENT) playHere(); } }];
+  overlays.forEach((c, i) => items.push({
+    label: c.name || (overlays.filter((o) => !o.name).length > 1 ? `Overlay ${i + 1}` : "Overlay"),
+    checked: live.speaker?.client === c.client,
+    run: () => mutate(() => api("/speaker/assign", { id: c.client }), `Playing on ${c.name || "overlay"}`),
+  }));
+  return items;
+}
+
 async function deviceMenu(anchor) {
+  const items = [...playOnItems(), { sep: true }];
   if (!OutClass.sinkSupported() || !navigator.mediaDevices?.enumerateDevices) {
-    return openMenu(anchor, [{ heading: "Output device" }, { note: "This browser can't pick an output here. Switch output in system settings." }]);
+    return openMenu(anchor, [...items, { heading: "Output device" }, { note: "Switch output in system settings." }]);
   }
   const devs = await listOutputs();
   const named = devs.filter((d) => d.label);
-  const items = [{ heading: "Output device" }];
+  items.push({ heading: "Output device" });
   items.push({ label: "System default", checked: !sinkId || sinkId === "default", run: () => pickSink("") });
   named.forEach((d) => items.push({ label: d.label, checked: d.deviceId === sinkId, run: () => pickSink(d.deviceId) }));
   if (navigator.mediaDevices.selectAudioOutput) {
@@ -1406,7 +1675,7 @@ async function deviceMenu(anchor) {
     });
   } else if (!named.length) {
     items.push({ sep: true },
-      { note: "Your browser only lists speakers after microphone access is allowed. Motif never records; the microphone is released immediately." },
+      { note: "Speaker names need microphone permission; nothing is recorded." },
       {
         label: "Show speakers…",
         run: async () => {
@@ -1451,6 +1720,23 @@ function showResult(id, r, okText) {
   } else {
     res.className = "result bad";
     res.textContent = `Failed${secs}: ${r.error || "unknown error"}`;
+  }
+}
+
+async function saveApp(btn) {
+  const count = parseInt($("app-prompt-count").value, 10);
+  if (!(count >= 2 && count <= 20)) { toast("Songs per prompt must be between 2 and 20"); return; }
+  const body = { startup: $("app-startup").value, repeat: $("app-repeat").value, prompt_count: count,
+    visualizer: $("app-visualizer").checked };
+  busyBtn(btn, true);
+  try {
+    const r = await api("/settings/app", body, "PUT");
+    appPrefs = r.app || appPrefs;
+    applySettings(r, "v-app");
+    toast("App settings saved");
+  } catch (e) {
+    toast(e.message);
+    busyBtn(btn, false);
   }
 }
 
@@ -1631,7 +1917,7 @@ function onClick(ev) {
     case "go": location.hash = el.dataset.href; break;
     case "pl-play": {
       const id = el.dataset.pl;
-      if (S?.mode?.playlist?.id === id && out?.cur) togglePause();
+      if (S?.mode?.playlist?.id === id && hasPlayback()) togglePause();
       else act(() => api(`/playlists/${enc(id)}/play`, {}));
       break;
     }
@@ -1639,6 +1925,7 @@ function onClick(ev) {
     case "pl-rename": renamePlaylist(el.dataset.pl); break;
     case "pl-delete": deletePlaylist(el.dataset.pl); break;
     case "chip": liked.genre = el.dataset.genre; fillLiked(); highlight(); break;
+    case "app-save": saveApp(el); break;
     case "ai-save": saveAI(el); break;
     case "ai-test": testAI(el); break;
     case "st-save": saveStorage(el); break;
@@ -1648,6 +1935,14 @@ function onClick(ev) {
     case "url-preset": presetURL(el); break;
     case "backup-now": backupNow(el); break;
     case "restore": restore(el.dataset.key); break;
+    case "key-create": createKey(el); break;
+    case "key-revoke": revokeKey(el); break;
+    case "key-done": dismissNewKey(); break;
+    case "copy": {
+      const src = $(el.dataset.for);
+      if (src) copyText(src.textContent).then((ok) => toast(ok ? "Copied" : "Copy failed: select and copy it manually"));
+      break;
+    }
   }
 }
 
@@ -1690,16 +1985,19 @@ function bind() {
   };
   $("volume").value = volume;
   $("volume").oninput = (e) => setVolume(parseFloat(e.target.value));
-  $("mute").onclick = () => setVolume(volume > 0 ? 0 : unmuteTo);
+  $("mute").onclick = () => setVolume(shownVolume() > 0 ? 0 : unmuteTo);
+  $("play-here").onclick = playHere;
 
   // Liked view toolbar lives in the skeleton; only its results re-render.
   $("view").addEventListener("input", (ev) => {
     if (ev.target.id === "liked-q") { liked.q = ev.target.value; fillLiked(); highlight(); }
+    if (ev.target.id === "ov-name") updateOverlayURL();
     const card = ev.target.closest?.(".settings-card");
     if (card) syncCard(card);
   });
   $("view").addEventListener("change", (ev) => {
     if (ev.target.id === "liked-sort") { liked.sort = ev.target.value; fillLiked(); highlight(); }
+    if (ev.target.id?.startsWith("ov-")) updateOverlayURL();
     const card = ev.target.closest?.(".settings-card");
     if (card) syncCard(card);
   });
@@ -1748,8 +2046,11 @@ async function init() {
   await loadGenres();
   await refresh();
   await loadLib();
+  loadAppPrefs();
   onRoute();
-  setInterval(refresh, 1000);
+  requestAnimationFrame(drawPlayerViz);
+  // Live state over SSE (same origin, no key); a slow /state poll runs only while it is down.
+  streamEvents(`/events?client=${enc(CLIENT)}&kind=site`, {}, onLive, onLiveStatus);
   setInterval(tick, 100);
   setInterval(loadLib, 15000);
 }

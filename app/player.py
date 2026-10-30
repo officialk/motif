@@ -109,6 +109,13 @@ class Player:
         self.claude_ratio = claude_ratio
         self.on_history = on_history
         self.lock = threading.RLock()
+        # Live sync: every change bumps `version` and wakes the SSE streams waiting on `changed`.
+        self.changed = threading.Condition(self.lock)
+        self.version = 0
+        self.speaker: Optional[dict] = None  # {client, kind, since}: the one client that plays audio
+        self.playback: Optional[dict] = None  # last report from the speaker
+        self.command: Optional[dict] = None  # last remote command for the speaker
+        self.clients: dict[str, dict] = {}  # connected pages/overlays: client -> {kind, name, audio, since, streams}
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="render")
         self.tracks: OrderedDict[str, Track] = OrderedDict()
         self.now_playing: Optional[Track] = None
@@ -194,6 +201,7 @@ class Player:
             # Re-plan the prefetched song so the change applies to what plays next.
             if self.now_playing is not None:
                 self.up_next = self._make_next()
+            self._changed()
 
     def skip(self, from_id: str | None = None) -> bool:
         """Advance to the prefetched track. With from_id, only if that is still playing (no double skips)."""
@@ -214,6 +222,7 @@ class Player:
             kept = [t for t in self.history if not (t.spec and t.spec.audio_hash() == spec_hash)]
             self.history.clear()
             self.history.extend(kept)
+            self._changed()
             return any(t and t.spec and t.spec.audio_hash() == spec_hash for t in (self.now_playing, self.up_next))
 
     # --- state ------------------------------------------------------------
@@ -235,6 +244,100 @@ class Player:
     def shutdown(self) -> None:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
+    # --- live sync (SSE) ----------------------------------------------------
+
+    def _changed(self) -> None:
+        """Call with the lock held after any change clients should see."""
+        self.version += 1
+        self.changed.notify_all()
+
+    def wait_change(self, version: int, timeout: float) -> int:
+        """Block until the version differs from `version` (or timeout); returns the current version."""
+        with self.changed:
+            if self.version == version:
+                self.changed.wait(timeout)
+            return self.version
+
+    def live(self) -> dict:
+        """Everything a client needs to render and play, as one versioned snapshot."""
+        with self.lock:
+            clients = [{k: v for k, v in c.items() if k != "streams"} | {"client": cid}
+                       for cid, c in self.clients.items()]
+            return {"version": self.version, "state": self.state(), "speaker": self.speaker,
+                    "playback": self.playback, "command": self.command, "clients": clients,
+                    "server_time": time.time()}
+
+    def connect_client(self, client: str, kind: str, name: Optional[str], audio: bool) -> None:
+        """A page or overlay opened its event stream (a client may briefly hold two while reconnecting)."""
+        with self.lock:
+            c = self.clients.get(client)
+            if c is None:
+                self.clients[client] = {"kind": kind, "name": name, "audio": audio, "since": time.time(), "streams": 1}
+            else:
+                c["streams"] += 1
+            self._changed()
+
+    def disconnect_client(self, client: str) -> None:
+        with self.lock:
+            c = self.clients.get(client)
+            if c is None:
+                return
+            c["streams"] -= 1
+            if c["streams"] <= 0:
+                del self.clients[client]
+                if self.speaker and self.speaker["client"] == client:
+                    self.speaker, self.playback = None, None  # a gone client can't play audio
+                self._changed()
+
+    def assign_speaker(self, client: str) -> dict:
+        """Move the audio to a connected client that can play (e.g. from the site's "Play on" menu)."""
+        with self.lock:
+            c = self.clients.get(client)
+            if c is None:
+                raise LookupError("that player is not connected")
+            if not c["audio"]:
+                raise ValueError("that overlay is display-only (audio=0)")
+            if not self.speaker or self.speaker["client"] != client:
+                self.speaker = {"client": client, "kind": c["kind"], "since": time.time()}
+                self.playback = None
+                self._changed()
+            return self.speaker
+
+    def claim_speaker(self, client: str, kind: str, force: bool = False) -> Optional[dict]:
+        """Overlays always take over; a site tab only when nobody plays (or with force: "Play here")."""
+        with self.lock:
+            current = self.speaker
+            if current is None or current["client"] == client or kind == "overlay" or force:
+                if current is None or current["client"] != client:
+                    self.speaker = {"client": client, "kind": kind, "since": time.time()}
+                    self.playback = None
+                    self._changed()
+            return self.speaker
+
+    def report_playback(self, client: str, track_id: Optional[str], state: str, position: float,
+                        volume: float) -> bool:
+        with self.lock:
+            if not self.speaker or self.speaker["client"] != client:
+                return False
+            self.playback = {"client": client, "track_id": track_id, "state": state,
+                             "position": max(0.0, float(position)), "at": time.time(),
+                             "volume": min(max(float(volume), 0.0), 1.0)}
+            self._changed()
+            return True
+
+    def send_command(self, action: str, t: Optional[float] = None, volume: Optional[float] = None) -> dict:
+        with self.lock:
+            if self.speaker is None:
+                raise LookupError("nothing is playing audio right now")
+            seq = (self.command or {}).get("seq", 0) + 1
+            self.command = {"seq": seq, "action": action, "at": time.time()}
+            if t is not None:
+                self.command["t"] = max(0.0, float(t))
+            if volume is not None:
+                self.command["volume"] = min(max(float(volume), 0.0), 1.0)
+            self._changed()
+            return self.command
+
     # --- internals --------------------------------------------------------
 
     def _replace_now(self, track: Track) -> None:
@@ -252,6 +355,7 @@ class Player:
         # Prefetch: as soon as a song is chosen, start on the next one.
         self.up_next = self._make_next()
         self._prune()
+        self._changed()
 
     def _make_next(self) -> Track:
         now = self.now_playing
@@ -335,10 +439,12 @@ class Player:
             with self.lock:
                 track.spec, track.source, track.status = spec, source, "rendering"
                 track.genre = spec.genre
+                self._changed()
         except Exception as e:  # spec_maker already falls back; this is a last resort
             log.exception("spec generation failed")
             with self.lock:
                 track.status, track.error = "error", f"generation failed: {e}"
+                self._changed()
             track.ready_event.set()
             return
         self._render_job(track)
@@ -350,10 +456,12 @@ class Player:
             log.info("rendered %s %r (%s) in %.2fs", track.genre, track.spec.name, track.source, time.time() - t0)
             with self.lock:
                 track.status = "ready"
+                self._changed()
         except Exception as e:
             log.exception("render failed")
             with self.lock:
                 track.status, track.error = "error", f"render failed: {e}"
+                self._changed()
         finally:
             track.ready_event.set()
 

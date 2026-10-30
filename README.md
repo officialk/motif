@@ -215,6 +215,51 @@ Tests:
 | `S3_BACKUP_INTERVAL_HOURS` | `0` | Scheduled backups; 0 = manual only |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | | S3 credentials (fallback when none are saved in Settings) |
 
+## Overlay and remote control
+
+Motif can be driven from outside — a stream overlay, Streamer.bot / Firebot reacting to Twitch channel points, or any script — while one place plays the audio.
+
+**Sync.** The server is the single source of truth. Every page and the overlay keep a Server-Sent Events stream open (`GET /events`) and receive a full, versioned snapshot whenever anything changes, so an API call (skip, change radio, play a playlist) shows up everywhere within milliseconds.
+
+**Speaker and remotes.** Exactly one client plays audio: the *speaker*. An overlay always becomes the speaker; a site tab becomes it only when nothing else is playing, or with **Play here**. Every other page is a remote: it shows the speaker's position and sends pause/seek/volume as commands. Only the speaker hands over to the next song at the end of the last bar.
+
+**API keys.** Create them in Settings → API keys with only the scopes needed. The token is shown once; only its hash is stored.
+
+| Scope | Allows |
+|---|---|
+| `read` | `GET /state`, `/events`, `/history`, `/library`, `/playlists`, `/playlists/{id}`, `/genres`, `/audio/{id}.mp3` |
+| `control` | `POST /skip`, `/repeat`, `/genre`, `/random`, `/play`, `/playlists/{id}/play`, `/like`, `/control` (60/min) |
+| `request` | `POST /prompt` (6/min; makes AI calls when a backend is on) |
+| `speaker` | `POST /speaker/claim`, `/playback`, plus `read` (for the overlay) |
+
+Settings, keys, backups, downloads and library edits are never reachable with a key. Send the key as a header:
+
+```sh
+curl -X POST http://127.0.0.1:8000/skip -H "Authorization: Bearer mk_..."
+```
+
+```sh
+curl -X POST http://127.0.0.1:8000/genre -H "Authorization: Bearer mk_..." -H "Content-Type: application/json" -d '{"genre": "jazz"}'
+```
+
+```sh
+curl -X POST http://127.0.0.1:8000/control -H "Authorization: Bearer mk_..." -H "Content-Type: application/json" -d '{"action": "toggle"}'
+```
+
+**Overlay.** Add a Browser Source in OBS (or open it in a tab) with the URL built in Settings → API keys:
+
+```
+http://127.0.0.1:8000/overlay?layout=card&pos=bl&key=mk_...
+```
+
+- Give the overlay a key with only the `speaker` scope (or `read` with `audio=0`). The overlay removes `key` from the address bar, keeps it for the tab's session (so OBS refreshes still work), and sends it only as an `Authorization` header; the server masks `key=` in its access log. `#key=…` also works. Without a key the overlay doesn't connect, so revoking the key always stops it.
+- `layout=card|bar|mini`, `pos=bl|br|tl|tr`, `progress=0|1`, `audio=1|0` (`0` = display only, no sound), `viz=1` (live audio bars in the art), `name=…` (label in the site's **Play on** menu).
+- In OBS tick **Control audio via OBS** to give the music its own mixer fader, and turn off **Shutdown source when not visible** so scene switches don't stop the music. In a normal browser tab, click once to allow sound.
+
+**Events stream** (`GET /events?client=<id>&kind=overlay|site`): `event: state` with `data` = `{version, state, speaker, playback, command, server_time}`; a `: ping` comment every 15 s keeps idle connections open.
+
+**Twitch channel points.** Point a reward in Streamer.bot / Firebot / SAMMI at an HTTP request: e.g. "Skip song" → `POST /skip`, "Switch radio" → `POST /genre` with the viewer's text as `genre`, "Request a vibe" → `POST /prompt` with `{"text": "<viewer input>"}`. Use a key with `control` (and `request` for prompts).
+
 ## API
 
 JSON in and out. Errors are `{"detail": "..."}` with a 4xx status. `GET /state` returns `{now, up_next, history, mode}`.

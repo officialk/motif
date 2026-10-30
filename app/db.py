@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 log = logging.getLogger(__name__)
 
 # Order matters: parents before children (inserts), reversed for deletes.
-TABLES = ("songs", "playlists", "playlist_songs", "history", "settings", "secrets")
+TABLES = ("songs", "playlists", "playlist_songs", "history", "settings", "secrets", "api_keys")
 REQUIRED_TABLES = ("songs", "playlists", "playlist_songs", "history", "settings")
 
 _SCHEMA = (
@@ -43,6 +43,9 @@ _SCHEMA = (
         key TEXT, scale TEXT, music_seconds {float}, source TEXT, played_at {float} NOT NULL, spec TEXT)""",
     "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS secrets (name TEXT PRIMARY KEY, value {blob} NOT NULL)",
+    """CREATE TABLE IF NOT EXISTS api_keys (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL,
+        prefix TEXT NOT NULL, created {float} NOT NULL, last_used {float})""",
 )
 _TYPES = {
     "sqlite": {"float": "REAL", "autoid": "INTEGER PRIMARY KEY AUTOINCREMENT", "blob": "BLOB"},

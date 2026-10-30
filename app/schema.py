@@ -17,7 +17,7 @@ Genre = Literal[
     "lofi", "ambient", "synthwave", "jazz", "techno",
     "chiptune", "classical-piano", "house", "trip-hop",
     "drum-and-bass", "hip-hop", "reggae", "bossa-nova", "funk",
-    "cinematic", "disco", "city-pop", "blues",
+    "cinematic", "disco", "city-pop", "blues", "punjabi-beats",
 ]
 GENRES: tuple[str, ...] = Genre.__args__  # type: ignore[attr-defined]
 
@@ -56,23 +56,26 @@ GENRE_TEMPO: dict[str, tuple[int, int]] = {
     "disco": (114, 126),
     "city-pop": (100, 120),
     "blues": (70, 120),
+    "punjabi-beats": (86, 100),
 }
 
 # GM program numbers (0-indexed) allowed per role. Anything else is rejected.
 ROLE_PROGRAMS: dict[str, frozenset[int]] = {
     "pad": frozenset({48, 49, 50, 51, 52, 53, 54, 88, 89, 90, 91, 92, 93, 94, 95}),
-    "lead": frozenset({0, 4, 5, 8, 9, 11, 12, 22, 24, 26, 40, 56, 60, 61, 65, 66, 68, 71, 73, 80, 81, 82, 84, 87}),
+    "lead": frozenset({0, 4, 5, 8, 9, 11, 12, 22, 24, 26, 40, 56, 60, 61, 65, 66, 68, 71, 73, 80, 81, 82, 84, 87, 104, 105, 106, 111}),
     "bass": frozenset({32, 33, 34, 35, 36, 37, 38, 39, 43, 80, 81}),
-    "keys": frozenset({0, 1, 2, 4, 5, 7, 8, 11, 16, 17, 18, 24, 25, 26, 27, 46, 48, 61, 80, 81}),
+    "keys": frozenset({0, 1, 2, 4, 5, 7, 8, 11, 16, 17, 18, 24, 25, 26, 27, 46, 48, 61, 80, 81, 104, 105, 106}),
 }
 # Drum kits live on MIDI channel 10 (bank 128); these are the GS kit programs.
 DRUM_KITS: frozenset[int] = frozenset({0, 8, 16, 24, 25, 32, 40, 48})
 
-DrumPiece = Literal["kick", "snare", "clap", "rim", "closed_hat", "open_hat", "ride", "shaker", "tom_low", "tom_high", "crash"]
+DrumPiece = Literal["kick", "snare", "clap", "rim", "closed_hat", "open_hat", "ride", "shaker", "tom_low", "tom_high", "crash",
+                    "conga_low", "bongo_high"]
 # GM percussion note per kit piece.
 DRUM_NOTES: dict[str, int] = {
     "kick": 36, "snare": 38, "clap": 39, "rim": 37, "closed_hat": 42,
     "open_hat": 46, "ride": 51, "shaker": 70, "tom_low": 45, "tom_high": 50, "crash": 49,
+    "conga_low": 64, "bongo_high": 60,  # hand drums: the closest GM sounds to dhol / dholak
 }
 
 BassStyle = Literal["root", "root_fifth", "octave", "walking", "arp", "drone"]

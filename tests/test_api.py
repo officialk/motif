@@ -75,3 +75,25 @@ def test_startup_cues_last_played_or_a_random_radio(client):
     again = client.get("/now").json()["now"]
     assert again["hash"] == last
     assert again["id"] != first["id"]
+
+
+def test_app_settings_defaults_and_effects(client):
+    from app.main import cue_startup_song
+
+    s = client.get("/settings").json()["app"]
+    assert s == {"startup": "last", "repeat": "off", "prompt_count": 8, "visualizer": True}
+    s = client.put("/settings/app", json={"startup": "genre:funk", "repeat": "all", "prompt_count": 3,
+                                          "visualizer": False}).json()["app"]
+    assert s == {"startup": "genre:funk", "repeat": "all", "prompt_count": 3, "visualizer": False}
+    assert client.get("/state").json()["mode"]["repeat"] == "all"  # applied right away
+    assert client.post("/prompt", json={"text": "chill"}).json()["playlist"]["count"] == 3
+    client.post("/repeat", json={"mode": "off"})
+    cue_startup_song(client.player, client.library)  # what a server start does
+    st = client.get("/state").json()
+    assert st["now"]["genre"] == "funk" and st["mode"]["repeat"] == "all"
+    for bad in ({"startup": "genre:polka"}, {"startup": "whatever"}, {"prompt_count": 1}, {"repeat": "twice"}):
+        assert client.put("/settings/app", json=bad).status_code in (400, 422), bad
+    client.put("/settings/app", json={"startup": "none"})
+    before = client.get("/state").json()["now"]["id"]
+    cue_startup_song(client.player, client.library)
+    assert client.get("/state").json()["now"]["id"] == before  # nothing new cued

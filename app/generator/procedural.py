@@ -467,6 +467,32 @@ RULES: dict[str, GenreRules] = {
         words=(("Muddy", "Crossroad", "Midnight", "Lonesome", "Dusty", "Smoky", "Rusty", "Southern"),
                ("Shuffle", "Station", "Porch", "Highway", "Juke", "Levee", "Railway", "Rambler")),
     ),
+    "punjabi-beats": GenreRules(
+        # Punjabi rap / hip-hop: trap-style drums and long 808s under a dark minor loop,
+        # with a tumbi-like pluck, sitar or flute carrying the melody.
+        scales=("minor", "phrygian", "harmonic_minor", "dorian"),
+        progressions=(
+            [(1, T, 8), (6, T, 8)],
+            [(1, T, 4), (7, T, 4), (6, T, 4), (5, T, 4)],
+            [(1, T, 8), (4, T, 8)],
+            [(6, T, 4), (5, T, 4), (1, T, 8)],
+        ),
+        drums=(
+            {"kick": "X......X..X.....", "clap": "....X.......X...", "closed_hat": "xxxxxxXxxxxxxXxx", "open_hat": "..............x."},
+            {"kick": "X..X......X..X..", "snare": "....X.......X...", "closed_hat": "x.x.xxx.x.x.xxxx", "rim": "...........o...."},
+            {"kick": "X.....X...X.....", "clap": "....X.......X..o", "closed_hat": "xxxXxxxxxxxXxxxx", "open_hat": "......x........."},
+        ),
+        bass_styles=("root",),
+        bass_grids=("X......x..X.....", "X..x......X..x..", "X.....x...X....."),
+        keys_styles=("sustain", "broken", "stabs"),
+        pad=(48, 49, None), lead=(106, 104, 73, 81), bass=(38, 39), keys=(0, 48, 4),
+        kits=(25, 24, 0), swing=(0.0, 0.08), swing_grid=16, humanize=(0.05, 0.15),
+        bars=(4, 8), tail=(1, 2), density=(0.3, 0.5), registers=("mid", "high"),
+        bass_octave=(1,), fill_chance=0.3,
+        forms=(STANDARD, SONG,),
+        words=(("Midnight", "Golden", "Royal", "Concrete", "Desert", "Smoke", "Street", "Velvet"),
+               ("Lane", "Throne", "Highway", "Skyline", "Convoy", "Crown", "Hustle", "Signal")),
+    ),
 }
 
 assert set(RULES) == set(GENRES)
@@ -484,6 +510,7 @@ _DARK_SCALES = ("minor", "phrygian", "harmonic_minor", "dorian")
 
 # Prompt words -> radio (genre). Checked in order; first match wins.
 _GENRE_WORDS: list[tuple[str, tuple[str, ...]]] = [
+    ("punjabi-beats", ("punjabi", "punjab", "desi rap", "desi hip hop", "desi hip-hop", "tumbi", "desi")),
     ("drum-and-bass", ("drum and bass", "drum & bass", "drum n bass", "dnb", "d&b", "jungle", "liquid")),
     ("city-pop", ("city pop", "city-pop", "citypop", "tokyo", "japanese 80s", "80s japan")),
     ("chiptune", ("chiptune", "8-bit", "8 bit", "8bit", "retro game", "video game", "arcade", "pixel", "nes ", "gameboy")),

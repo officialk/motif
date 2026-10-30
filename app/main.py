@@ -12,6 +12,7 @@ Back up / restore the database to S3:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -27,11 +28,11 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from app import config, credentials, storage
+from app import apikeys, config, credentials, storage
 from app.engine.fluidsynth_engine import FluidSynthEngine
 from app.generator import ai, clean_mood, make_spec, procedural
 from app.library import Library, LibraryError, safe_filename
@@ -49,7 +50,32 @@ class GenreBody(BaseModel):
 
 class PromptBody(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
-    count: int = Field(default=8, ge=2, le=20, description="Songs in the generated playlist")
+    count: Optional[int] = Field(default=None, ge=2, le=20, description="Songs in the playlist (default: app setting)")
+
+
+STARTUP_CHOICES = ("last", "random", "none", *(f"genre:{g}" for g in GENRES))
+
+
+class AppSettings(BaseModel):
+    """Defaults set in Settings -> App (stored in the database, applied on every device)."""
+    startup: str = "last"  # last | random | none | genre:<name>
+    repeat: Literal["off", "all", "one"] = "off"
+    prompt_count: int = Field(default=8, ge=2, le=20)
+    visualizer: bool = True
+
+    @field_validator("startup")
+    @classmethod
+    def _startup(cls, v: str) -> str:
+        if v not in STARTUP_CHOICES:
+            raise ValueError("startup must be one of last, random, none or genre:<name>")
+        return v
+
+
+class AppSettingsBody(BaseModel):
+    startup: Optional[str] = None
+    repeat: Optional[Literal["off", "all", "one"]] = None
+    prompt_count: Optional[int] = Field(default=None, ge=2, le=20)
+    visualizer: Optional[bool] = None
 
 
 class RandomBody(BaseModel):
@@ -118,6 +144,31 @@ AI_KEYS = ("anthropic_api_key", "openai_api_key")
 S3_KEYS = ("aws_access_key_id", "aws_secret_access_key")
 
 
+class ClaimBody(BaseModel):
+    client: str = Field(min_length=1, max_length=64)
+    kind: Literal["overlay", "site"] = "site"
+    force: bool = False
+
+
+class PlaybackBody(BaseModel):
+    client: str = Field(min_length=1, max_length=64)
+    track_id: Optional[str] = Field(default=None, max_length=64)
+    state: Literal["playing", "paused"]
+    position: float = Field(ge=0, le=36000)
+    volume: float = Field(default=1.0, ge=0, le=1)
+
+
+class ControlBody(BaseModel):
+    action: Literal["pause", "resume", "toggle", "seek", "volume"]
+    t: Optional[float] = Field(default=None, ge=0, le=36000)
+    volume: Optional[float] = Field(default=None, ge=0, le=1)
+
+
+class NewKeyBody(BaseModel):
+    name: str = Field(max_length=200)
+    scopes: list[str] = Field(max_length=8)
+
+
 class RestoreBody(BaseModel):
     key: str = Field(max_length=500)
 
@@ -126,6 +177,7 @@ def create_app(player: Player | None = None, library: Library | None = None,
                backups: storage.BackupStore | None = None) -> FastAPI:
     lib = library or Library()
     creds = credentials.Credentials(lib.db)
+    keys = apikeys.ApiKeys(lib.db)
     credentials.use(creds)
     scheduler: list[storage.BackupScheduler] = []
 
@@ -165,9 +217,27 @@ def create_app(player: Player | None = None, library: Library | None = None,
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=config.ALLOWED_HOSTS)
 
     @app.middleware("http")
-    async def same_origin_writes(request: Request, call_next):
-        # No auth: block other web pages from driving the API (it can forward the OpenAI key
-        # to the configured base URL, so settings must only change from this app's own page).
+    async def access(request: Request, call_next):
+        """API keys for tools/overlays; otherwise the same-origin browser rules.
+
+        With `Authorization: Bearer mk_…` a request is allowed only within the key's scopes
+        (settings, admin and library edits are never reachable with a key). Without a key,
+        other web pages are blocked from changing anything: the API can forward the OpenAI
+        key to the configured base URL, so settings must only change from this app's own page.
+        """
+        auth = request.headers.get("authorization")
+        if auth is not None:
+            token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+            key = await asyncio.to_thread(keys.verify, token) if token else None
+            if key is None:
+                return JSONResponse({"detail": "invalid API key"}, status_code=401)
+            scope = apikeys.required_scope(request.method, request.url.path)
+            if scope is None or not apikeys.has_scope(key["scopes"], scope):
+                return JSONResponse({"detail": "this API key can't do that"}, status_code=403)
+            if not keys.allow(key["id"], scope):
+                return JSONResponse({"detail": "too many requests for this API key"}, status_code=429)
+            request.state.api_key = key
+            return await call_next(request)
         origin = request.headers.get("origin")
         if request.method not in ("GET", "HEAD", "OPTIONS") and origin is not None:
             if urlsplit(origin).hostname not in config.ALLOWED_HOSTS:
@@ -176,6 +246,7 @@ def create_app(player: Player | None = None, library: Library | None = None,
 
     app.state.player = player
     app.state.library = lib
+    app.state.sse_ping = 15.0  # seconds between keep-alive comments on idle streams
     app.state.backups = backups
     app.state.storage_settings = _load_storage_settings(lib)
 
@@ -258,7 +329,8 @@ def create_app(player: Player | None = None, library: Library | None = None,
             raise HTTPException(400, "empty prompt")
         use_ai = ai.get_settings().backend != "off"
         genre = None if use_ai else procedural.genre_from_prompt(text)
-        title, songs = ai.make_playlist(genre, text, body.count, use_ai)
+        count = body.count or load_app_settings(lib).prompt_count
+        title, songs = ai.make_playlist(genre, text, count, use_ai)
         pl = lib.create_playlist(title)
         for spec, source in songs:
             entry, _ = lib.save(spec, source)
@@ -272,9 +344,78 @@ def create_app(player: Player | None = None, library: Library | None = None,
         return p().state()
 
     @app.post("/skip")
-    def skip(body: SkipBody | None = None):
+    def skip(request: Request, body: SkipBody | None = None):
+        key = getattr(request.state, "api_key", None)
+        if key and "control" not in key["scopes"] and not (body and body.from_id):
+            raise HTTPException(403, "a speaker key can only advance at the end of the playing song (from_id)")
         moved = p().skip(body.from_id if body else None)
         return {"skipped": moved, **p().state()}
+
+    # --- live sync: SSE, speaker and remote control -----------------------------
+
+    @app.get("/events")
+    async def events(request: Request, client: str = Query(min_length=1, max_length=64),
+                     kind: Literal["overlay", "site"] = "site",
+                     name: Optional[str] = Query(default=None, max_length=40), audio: bool = True):
+        """Server-Sent Events: a full versioned snapshot now and after every change."""
+        player = p()
+        key = getattr(request.state, "api_key", None)
+        label = " ".join(name.split())[:40] if name else None
+        player.connect_client(client, kind, label or None, audio)
+
+        async def stream():
+            last = -1
+            try:
+                while not await request.is_disconnected():
+                    if key and key["id"] in keys.revoked:
+                        break  # revoked while connected: end the stream (and its speaker role) now
+                    version = await asyncio.to_thread(player.wait_change, last, app.state.sse_ping)
+                    if version == last:
+                        if key and not await asyncio.to_thread(keys.active, key["id"]):
+                            break
+                        yield ": ping\n\n"  # keep proxies and the client from timing out
+                        continue
+                    snap = player.live()
+                    last = snap["version"]
+                    yield f"event: state\nid: {last}\ndata: {json.dumps(snap, separators=(',', ':'))}\n\n"
+            finally:
+                player.disconnect_client(client)  # releases the speaker role if this was the last stream
+
+        return StreamingResponse(stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.post("/speaker/claim")
+    def claim_speaker(body: ClaimBody):
+        return {"speaker": p().claim_speaker(body.client, body.kind, body.force)}
+
+    @app.post("/speaker/assign")
+    def assign_speaker(body: IdBody):
+        """Play on another connected player (an overlay, or this tab via its client id)."""
+        try:
+            return {"speaker": p().assign_speaker(body.id)}
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+
+    @app.post("/playback")
+    def playback(body: PlaybackBody):
+        """The speaker reports what it is doing so remotes can show the same position."""
+        if not p().report_playback(body.client, body.track_id, body.state, body.position, body.volume):
+            raise HTTPException(409, "this client is not the speaker")
+        return {"ok": True}
+
+    @app.post("/control")
+    def control(body: ControlBody):
+        """Remote control for the speaker: pause, resume, toggle, seek, volume."""
+        if body.action == "seek" and body.t is None:
+            raise HTTPException(422, "seek needs t (seconds)")
+        if body.action == "volume" and body.volume is None:
+            raise HTTPException(422, "volume needs volume (0..1)")
+        try:
+            return {"command": p().send_command(body.action, body.t, body.volume)}
+        except LookupError as e:
+            raise HTTPException(409, str(e)) from e
 
     @app.post("/repeat")
     def repeat(body: RepeatBody):
@@ -418,6 +559,7 @@ def create_app(player: Player | None = None, library: Library | None = None,
     def settings_payload() -> dict:
         st: storage.StorageSettings = app.state.storage_settings
         return {
+            "app": load_app_settings(lib).model_dump(),
             "ai": ai.get_settings().public(),
             "storage": {
                 **st.fields(), "bucket": st.bucket or None, "enabled": st.enabled,
@@ -449,6 +591,17 @@ def create_app(player: Player | None = None, library: Library | None = None,
         p().claude_ratio = _ai_ratio()
         return settings_payload()
 
+    @app.put("/settings/app")
+    def update_app(body: AppSettingsBody):
+        try:
+            new = AppSettings(**{**load_app_settings(lib).model_dump(), **body.model_dump(exclude_none=True)})
+        except ValidationError as e:
+            raise HTTPException(400, e.errors()[0]["msg"]) from e
+        lib.set_setting("app", new.model_dump())
+        if body.repeat is not None:
+            p().set_repeat(new.repeat)  # the default applies right away too
+        return settings_payload()
+
     @app.put("/settings/storage")
     def update_storage(body: StorageSettingsBody):
         changes = body.model_dump(exclude_none=True)
@@ -470,6 +623,26 @@ def create_app(player: Player | None = None, library: Library | None = None,
     @app.post("/settings/ai/test")
     def test_ai():
         return ai.test_backend()
+
+    @app.get("/settings/keys")
+    def list_keys():
+        return {"keys": keys.list()}
+
+    @app.post("/settings/keys")
+    def create_key(body: NewKeyBody):
+        try:
+            key, token = keys.create(body.name, body.scopes)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        return {"key": key, "token": token}
+
+    @app.delete("/settings/keys/{key_id}")
+    def revoke_key(key_id: str):
+        if not keys.revoke(key_id):
+            raise HTTPException(404, "unknown key")
+        with p().changed:  # wake every stream so one using this key ends right away
+            p().changed.notify_all()
+        return {"ok": True}
 
     @app.get("/admin/backups")
     def list_backups():
@@ -494,6 +667,14 @@ def create_app(player: Player | None = None, library: Library | None = None,
         # Keep using the bucket we restored from even if the backup holds older storage settings.
         lib.set_setting("storage", app.state.storage_settings.fields())
         return {"ok": True}
+
+    @app.get("/overlay", include_in_schema=False)
+    def overlay():
+        """OBS/browser overlay page; its key travels in the URL fragment (#key=…), never to the server."""
+        # The key may arrive as ?key=…: don't let it leak through referrers or caches (and the access
+        # log redacts it, see RedactKeyFilter).
+        return FileResponse(config.WEB_DIR / "overlay.html", media_type="text/html",
+                            headers={"Referrer-Policy": "no-referrer", "Cache-Control": "no-store"})
 
     if config.WEB_DIR.exists():
         app.mount("/", StaticFiles(directory=config.WEB_DIR, html=True), name="web")
@@ -534,18 +715,49 @@ def _load_storage_settings(lib: Library) -> storage.StorageSettings:
         return base
 
 
+def load_app_settings(lib: Library) -> AppSettings:
+    try:
+        return AppSettings(**(lib.get_setting("app") or {}))
+    except ValidationError:
+        log.warning("ignoring invalid saved app settings")
+        return AppSettings()
+
+
+class RedactKeyFilter(logging.Filter):
+    """Mask API keys passed as `key=` query parameters (overlay URLs) in log lines."""
+
+    PATTERN = re.compile(r"(key=)[^&\s\"]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.args:
+            record.args = tuple(self.PATTERN.sub(r"\1***", a) if isinstance(a, str) else a for a in record.args)
+        if isinstance(record.msg, str):
+            record.msg = self.PATTERN.sub(r"\1***", record.msg)
+        return True
+
+
 def cue_startup_song(player: Player, lib: Library) -> None:
-    """Have something in the player on start: the last played song if it can be rebuilt, else a random radio.
+    """Cue what Settings -> App asks for on start: the last played song (if it can be rebuilt), a random
+    radio, a specific radio, or nothing. Also applies the default repeat mode.
 
     It is only cued (rendered and shown); the browser starts playback when the user presses play.
     """
-    for h in lib.history(limit=20):
-        found = lib.history_spec(h["id"])
-        if found is not None:
-            spec, source = found
-            player.play_spec(spec, source)
-            log.info("cued the last played song %r", spec.name)
-            return
+    prefs = load_app_settings(lib)
+    player.set_repeat(prefs.repeat)
+    if prefs.startup == "none":
+        return
+    if prefs.startup.startswith("genre:"):
+        player.play_genre(prefs.startup.split(":", 1)[1])
+        log.info("cued the %s radio", prefs.startup.split(":", 1)[1])
+        return
+    if prefs.startup == "last":
+        for h in lib.history(limit=20):
+            found = lib.history_spec(h["id"])
+            if found is not None:
+                spec, source = found
+                player.play_spec(spec, source)
+                log.info("cued the last played song %r", spec.name)
+                return
     genre = random.choice(GENRES)
     player.play_genre(genre)
     log.info("cued a %s radio song", genre)
@@ -603,6 +815,7 @@ def main(argv: list[str] | None = None) -> int:
     if config.HOST not in ("127.0.0.1", "localhost", "::1"):
         log.warning("listening on %s: Motif has no login, so anyone who can reach this port can control it "
                     "and use the saved API keys. Keep it behind localhost or an authenticating proxy.", config.HOST)
+    logging.getLogger("uvicorn.access").addFilter(RedactKeyFilter())
     uvicorn.run(create_app(), host=config.HOST, port=args.port, log_level="info")
     return 0
 

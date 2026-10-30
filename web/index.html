@@ -38,6 +38,7 @@
     </main>
   </div>
 
+  <canvas id="player-viz" aria-hidden="true" hidden></canvas>
   <footer class="player">
     <div class="np">
       <div id="np-art" class="art"></div>
@@ -57,11 +58,12 @@
       <div class="timeline">
         <span id="t-cur" class="t">0:00</span>
         <div id="seek" class="seek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
-          <div class="progress"><div id="song-bar"></div><div id="section-marks"></div></div><div id="seek-knob"></div>
+          <div class="progress"><div id="song-bar"></div></div><div id="seek-knob"></div>
         </div>
         <span id="t-total" class="t">0:00</span>
       </div>
-      <div class="np-line"><span id="section" class="section-label"></span><span id="np-status" class="np-status"></span></div>
+      <div class="np-line"><span id="np-status" class="np-status"></span>
+        <span id="remote" class="remote" role="status" hidden><span class="ico-sm" data-icon="cast"></span><span id="remote-text">Playing on another tab</span><button id="play-here" type="button" class="link-btn">Play here</button></span></div>
     </div>
     <div class="right">
       <button id="download" class="icon-btn" title="Download" aria-label="Download" data-icon="download"></button>
@@ -86,6 +88,7 @@
   </dialog>
   <div id="toast" role="status"></div>
   <script src="icons.js"></script>
+  <script src="audio.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
