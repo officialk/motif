@@ -55,19 +55,18 @@ def test_ai_settings_roundtrip_and_validation(client):
     s = client.get("/settings").json()
     assert s["ai"]["backend"] == "off" and set(s["ai"]["keys"]) == {"anthropic", "openai"}
     assert all(set(v) == {"set", "source"} for v in s["ai"]["keys"].values())
-    assert s["storage"]["enabled"] is False
-    try:
-        r = client.put("/settings/ai", json={"backend": "openai", "model": "llama3.1", "ratio": 0.5,
-                                              "base_url": "http://localhost:11434/v1"})
-        assert r.status_code == 200 and r.json()["ai"]["backend"] == "openai"
-        assert client.player.claude_ratio == 0.5
-        with sqlite3.connect(client.library.db_path) as db:  # persisted
-            assert "llama3.1" in db.execute("SELECT value FROM settings WHERE key = 'ai'").fetchone()[0]
-        assert client.put("/settings/ai", json={"backend": "skynet"}).status_code == 400
-        assert client.put("/settings/ai", json={"ratio": 3}).status_code == 400
-        assert client.get("/genres").json()["ai"]["backend"] == "openai"
-    finally:
-        ai.set_settings(ai.AISettings.from_config())
+    assert "storage" not in s and s["backup"]["enabled"] is False
+    assert s["account"] == {"id": "local", "email": "", "role": "admin"}
+    r = client.put("/settings/ai", json={"backend": "openai", "model": "llama3.1", "ratio": 0.5,
+                                          "base_url": "http://localhost:11434/v1"})
+    assert r.status_code == 200 and r.json()["ai"]["backend"] == "openai"
+    assert client.player.claude_ratio == 0.5
+    with sqlite3.connect(client.library.db_path) as db:  # persisted as the user's own row
+        assert "llama3.1" in db.execute("SELECT value FROM settings WHERE key = 'ai' AND user_id = 'local'"
+                                        ).fetchone()[0]
+    assert client.put("/settings/ai", json={"backend": "skynet"}).status_code == 400
+    assert client.put("/settings/ai", json={"ratio": 3}).status_code == 400
+    assert client.get("/genres").json()["ai"]["backend"] == "openai"
 
 
 def test_prompt_with_ai_on_uses_one_playlist_call(client, monkeypatch):
@@ -83,11 +82,8 @@ def test_prompt_with_ai_on_uses_one_playlist_call(client, monkeypatch):
         return _json.dumps({"title": "Warehouse at 4am", "songs": songs})
 
     monkeypatch.setitem(ai.BACKENDS, "openai", fake_backend)
-    try:
-        ai.set_settings(ai.AISettings(**{**ai.AISettings.from_config().__dict__, "backend": "openai"}))
-        s = client.post("/prompt", json={"text": "something dark for a warehouse at 4am"}).json()
-    finally:
-        ai.set_settings(ai.AISettings.from_config())
+    client.put("/settings/ai", json={"backend": "openai"})
+    s = client.post("/prompt", json={"text": "something dark for a warehouse at 4am"}).json()
     pl = s["playlist"]
     assert len(calls) == 1 and "REQUEST_DATA" in calls[0]
     assert pl["name"] == "Warehouse at 4am" and pl["count"] == 8 and pl["genres"] == ["techno"]
@@ -112,32 +108,25 @@ def test_unlike_keeps_playlist_songs(client):
     assert client.library.spec(entry["id"]) is None  # neither liked nor in a playlist: gone
 
 
-class FakeBackups:
-    def __init__(self):
-        self.made = []
+def test_backup_endpoints(client, monkeypatch):
+    from app import storage
+    from tests.test_storage import FakeS3
 
-    def backup(self, db_path):
-        item = {"key": f"motif/backups/motif-{len(self.made)}.db", "size": db_path.path.stat().st_size, "created": 1.0}
-        self.made.append(item)
-        return item
-
-    def list(self):
-        return list(reversed(self.made))
-
-    def restore(self, key, db_path):
-        from app.storage import StorageError
-        if key not in {b["key"] for b in self.made}:
-            raise StorageError("unknown backup")
-
-
-def test_backup_endpoints(client):
-    assert client.get("/admin/backups").json() == {"enabled": False, "backups": []}
-    assert client.post("/admin/backup").status_code == 400
-    client.app.state.backups = FakeBackups()
-    b = client.post("/admin/backup").json()["backup"]
-    assert client.get("/admin/backups").json()["backups"] == [b]
-    assert client.post("/admin/restore", json={"key": b["key"]}).json() == {"ok": True}
-    assert client.post("/admin/restore", json={"key": "../etc/passwd"}).status_code == 400
+    fake = FakeS3()
+    monkeypatch.setattr(storage, "s3_client", lambda settings, creds=None: fake)
+    assert client.get("/backups").json() == {"enabled": False, "backups": []}
+    assert client.post("/backups").status_code == 400  # not set up yet
+    client.put("/settings/backup", json={"bucket": "my-motif", "aws_access_key_id": "AKIATEST",
+                                         "aws_secret_access_key": "shh"})
+    b = client.post("/backups").json()["backup"]
+    assert b["key"].startswith("motif/backups/") and b["key"] in fake.objects
+    assert [x["key"] for x in client.get("/backups").json()["backups"]] == [b["key"]]
+    r = client.post("/backups/restore", json={"key": b["key"]}).json()
+    assert r["ok"] is True and set(r["restored"]) == {"songs", "playlists", "history", "api_keys"}
+    assert client.post("/backups/restore", json={"key": "../etc/passwd"}).status_code == 400
+    assert client.post("/backups/restore", json={"key": "motif/backups/motif-nope.db"}).status_code == 400
+    for old in ("/admin/backups", "/admin/backup", "/settings/storage"):  # server-wide storage is gone
+        assert client.get(old).status_code in (404, 405)
 
 
 @pytest.mark.parametrize("path", ["/state", "/library", "/playlists", "/settings", "/history"])
@@ -172,13 +161,10 @@ def test_generate_into_playlist_appends_and_joins_queue(client, monkeypatch):
         return _json.dumps({"title": "x", "songs": [{"genre": "jazz", "name": f"Extra {i}"} for i in range(n)]})
 
     monkeypatch.setitem(ai.BACKENDS, "openai", fake_backend)
-    try:
-        ai.set_settings(ai.AISettings(**{**ai.AISettings.from_config().__dict__, "backend": "openai"}))
-        pl = client.post("/prompt", json={"text": "rainy jazz", "count": 2}).json()["playlist"]
-        assert pl["prompt"] == "rainy jazz"
-        r = client.post(f"/playlists/{pl['id']}/generate", json={"count": 2, "genre": "lofi"}).json()
-    finally:
-        ai.set_settings(ai.AISettings.from_config())
+    client.put("/settings/ai", json={"backend": "openai"})
+    pl = client.post("/prompt", json={"text": "rainy jazz", "count": 2}).json()["playlist"]
+    assert pl["prompt"] == "rainy jazz"
+    r = client.post(f"/playlists/{pl['id']}/generate", json={"count": 2, "genre": "lofi"}).json()
     assert [a["genre"] for a in r["added"]] == ["lofi", "lofi"]  # a pinned genre wins
     assert r["playlist"]["count"] == 4
     data = calls[1].split("REQUEST_DATA")[1]

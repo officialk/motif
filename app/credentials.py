@@ -1,8 +1,8 @@
-"""API keys and S3 credentials entered in Settings, encrypted in the database (SQLite or Postgres).
+"""Each user's AI keys and S3 credentials entered in Settings, encrypted in the database (SQLite or Postgres).
 
 Each value is sealed with AES-256-GCM (random 96-bit nonce, the credential's
 name as associated data, so ciphertexts can't be swapped between names) and
-stored in the `secrets` table. The master key is never stored in the database:
+stored in the `secrets` table under its owner's user id. The master key is never stored in the database:
 
 1. `MOTIF_SECRET_KEY` (base64, 32 bytes) if set — best for Docker/servers;
 2. otherwise `<library>/secret.key` (next to the SQLite file), created once with mode 600.
@@ -12,8 +12,8 @@ a backup on a machine without the same key leaves those secrets unreadable
 (they show as "not set" and can be entered again).
 
 Values are write-only from the browser's point of view: the API only reports
-whether a key is set and where it comes from. A saved value wins; otherwise
-the usual environment variable is used.
+whether a key is set. There is no environment fallback: a user's AI and S3
+calls only ever use the keys that user saved (`Credentials.for_user`).
 """
 
 from __future__ import annotations
@@ -35,13 +35,9 @@ from app.db import Database, SQLiteDatabase
 
 log = logging.getLogger(__name__)
 
-# setting name -> environment variable used as a fallback
-NAMES: dict[str, str] = {
-    "anthropic_api_key": "ANTHROPIC_API_KEY",
-    "openai_api_key": "OPENAI_API_KEY",
-    "aws_access_key_id": "AWS_ACCESS_KEY_ID",
-    "aws_secret_access_key": "AWS_SECRET_ACCESS_KEY",
-}
+NAMES = ("anthropic_api_key", "openai_api_key", "aws_access_key_id", "aws_secret_access_key")
+AI_NAMES = ("anthropic_api_key", "openai_api_key")
+S3_NAMES = ("aws_access_key_id", "aws_secret_access_key")
 MAX_LEN = 512
 KEY_ENV = "MOTIF_SECRET_KEY"
 NONCE_BYTES = 12
@@ -104,22 +100,18 @@ class Credentials:
             log.warning("saved %s can't be decrypted with this master key (restored from elsewhere?)", name)
             return None
 
-    def _saved(self, name: str) -> Optional[str]:
+    def _saved(self, user_id: str, name: str) -> Optional[str]:
         with self.db.connect() as db:
-            row = db.execute("SELECT value FROM secrets WHERE name = ?", (name,)).fetchone()
+            row = db.execute("SELECT value FROM secrets WHERE user_id = ? AND name = ?", (user_id, name)).fetchone()
         return self._open(name, bytes(row[0])) if row else None
 
-    def get(self, name: str) -> Optional[str]:
-        return self._saved(name) or os.environ.get(NAMES[name]) or None
+    def get(self, name: str, user_id: str) -> Optional[str]:
+        return self._saved(user_id, name) or None
 
-    def status(self, name: str) -> dict:
-        if self._saved(name):
-            return {"set": True, "source": "settings"}
-        if os.environ.get(NAMES[name]):
-            return {"set": True, "source": "env"}
-        return {"set": False, "source": None}
+    def status(self, name: str, user_id: str) -> dict:
+        return {"set": True, "source": "settings"} if self._saved(user_id, name) else {"set": False, "source": None}
 
-    def update(self, values: dict[str, Optional[str]]) -> None:
+    def update(self, values: dict[str, Optional[str]], user_id: str) -> None:
         """name -> value: a non-empty string saves it, "" removes the saved value, None leaves it."""
         changes = {k: v for k, v in values.items() if v is not None}
         for name, value in changes.items():
@@ -133,11 +125,14 @@ class Credentials:
             for name, value in changes.items():
                 value = value.strip()
                 if value:
-                    db.execute("INSERT INTO secrets (name, value) VALUES (?, ?) "
-                               "ON CONFLICT(name) DO UPDATE SET value = excluded.value",
-                               (name, self._seal(name, value)))
+                    db.execute("INSERT INTO secrets (user_id, name, value) VALUES (?, ?, ?) "
+                               "ON CONFLICT(user_id, name) DO UPDATE SET value = excluded.value",
+                               (user_id, name, self._seal(name, value)))
                 else:
-                    db.execute("DELETE FROM secrets WHERE name = ?", (name,))
+                    db.execute("DELETE FROM secrets WHERE user_id = ? AND name = ?", (user_id, name))
+
+    def for_user(self, user_id: str) -> "UserCredentials":
+        return UserCredentials(self, user_id)
 
     def _import_plaintext_file(self) -> None:
         """One-time move of the older plain-text credentials.json into the encrypted table."""
@@ -148,25 +143,22 @@ class Credentials:
             data = json.loads(legacy.read_text())
         except (OSError, ValueError):
             data = {}
-        self.update({k: v for k, v in data.items() if k in NAMES and isinstance(v, str) and v})
+        self.update({k: v for k, v in data.items() if k in NAMES and isinstance(v, str) and v}, "local")
         legacy.unlink()
         log.info("moved saved credentials into the encrypted database table")
 
 
-_current: Optional[Credentials] = None
-_current_lock = threading.Lock()
+class UserCredentials:
+    """One user's keys (what the AI backends and that user's S3 client read)."""
 
+    def __init__(self, store: Credentials, user_id: str):
+        self.store, self.user_id = store, user_id
 
-def current() -> Credentials:
-    """The credentials store in use (the app points it at its database)."""
-    global _current
-    with _current_lock:
-        if _current is None:
-            _current = Credentials(config.DB_PATH)  # the app replaces this with its own database
-        return _current
+    def get(self, name: str) -> Optional[str]:
+        return self.store.get(name, self.user_id)
 
+    def status(self, name: str) -> dict:
+        return self.store.status(name, self.user_id)
 
-def use(store: Credentials) -> None:
-    global _current
-    with _current_lock:
-        _current = store
+    def update(self, values: dict[str, Optional[str]]) -> None:
+        self.store.update(values, self.user_id)

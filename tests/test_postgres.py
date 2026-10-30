@@ -76,8 +76,8 @@ def test_library_roundtrip(pg, tmp_path, spec):
 def test_encrypted_secrets_in_postgres(pg, tmp_path, monkeypatch):
     monkeypatch.delenv("MOTIF_SECRET_KEY", raising=False)
     store = credentials.Credentials(pg, key_file=tmp_path / "secret.key")
-    store.update({"openai_api_key": "sk-pg"})
-    assert store.get("openai_api_key") == "sk-pg"
+    store.update({"openai_api_key": "sk-pg"}, "u1")
+    assert store.get("openai_api_key", "u1") == "sk-pg" and store.get("openai_api_key", "u2") is None
     with pg.connect() as c:
         blob = bytes(c.execute("SELECT value FROM secrets").fetchone()[0])
     assert b"sk-pg" not in blob

@@ -2,8 +2,16 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Motif</title>
+  <meta name="theme-color" content="#08090b">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Motif">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon-180.png">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -14,6 +22,7 @@
         <a href="#/home" data-route="home"><span class="ico" data-icon="home"></span>Home</a>
         <a href="#/history" data-route="history"><span class="ico" data-icon="history"></span>Recently played</a>
         <a href="#/settings" data-route="settings"><span class="ico" data-icon="settings"></span>Settings</a>
+        <a href="#/members" data-route="members" class="admin-only" hidden><span class="ico" data-icon="group"></span>Members</a>
       </nav>
       <div class="lib-head">
         <span>Your library</span>
@@ -25,6 +34,10 @@
           <span class="lib-meta"><span class="lib-name">Liked songs</span><span id="liked-count" class="lib-sub"></span></span>
         </a>
         <div id="sidebar-playlists" class="sidebar-playlists"></div>
+      </div>
+      <div id="account" class="account" hidden>
+        <span id="account-email" class="account-email"></span>
+        <button id="logout" class="icon-btn" title="Log out" aria-label="Log out" data-icon="logout"></button>
       </div>
     </aside>
 
@@ -74,6 +87,56 @@
     </div>
   </footer>
 
+  <!-- Phones: mini player, Now Playing sheet and tab bar (driven by mobile.js; the player bar above stays the source of truth). -->
+  <div id="mini" class="mini" hidden>
+    <div class="mini-bar"><div id="mini-bar-fill"></div></div>
+    <button id="mini-open" class="mini-open" type="button" aria-label="Open Now Playing">
+      <div id="mini-art" class="art"></div>
+      <div class="np-meta"><div id="mini-name" class="np-name"></div><div id="mini-sub" class="np-sub"></div></div>
+    </button>
+    <button id="mini-like" class="icon-btn" aria-label="Like" aria-pressed="false" data-icon="favorite_border"></button>
+    <button id="mini-play" class="icon-btn mini-play" aria-label="Play" data-icon="play_arrow"></button>
+  </div>
+  <div id="sheet" class="sheet" role="dialog" aria-modal="true" aria-label="Now Playing" hidden>
+    <div class="sheet-top">
+      <button id="sheet-close" class="icon-btn" aria-label="Close Now Playing" data-icon="expand_more"></button>
+      <div class="sheet-title">Now Playing</div>
+      <button id="sheet-add" class="icon-btn" aria-label="Add to playlist" data-icon="add"></button>
+    </div>
+    <div class="sheet-body">
+      <div id="sheet-art" class="art sheet-art"></div>
+      <div class="sheet-meta">
+        <div class="sheet-meta-text"><div id="sheet-name" class="sheet-name"></div><div id="sheet-sub" class="np-sub"></div></div>
+        <button id="sheet-like" class="icon-btn" aria-label="Like" aria-pressed="false" data-icon="favorite_border"></button>
+      </div>
+      <div class="timeline">
+        <span id="sheet-cur" class="t">0:00</span>
+        <div id="sheet-seek" class="seek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
+          <div class="progress"><div id="sheet-fill"></div></div><div id="sheet-knob"></div>
+        </div>
+        <span id="sheet-total" class="t">0:00</span>
+      </div>
+      <div class="sheet-buttons">
+        <button id="sheet-shuffle" class="icon-btn repeat" aria-label="Shuffle" data-icon="shuffle"></button>
+        <button id="sheet-prev" class="icon-btn big" aria-label="Previous" data-icon="skip_previous"></button>
+        <button id="sheet-play" class="play-btn" aria-label="Play" data-icon="play_arrow"></button>
+        <button id="sheet-skip" class="icon-btn big" aria-label="Next" data-icon="skip_next"></button>
+        <button id="sheet-repeat" class="icon-btn repeat" aria-label="Repeat" data-icon="repeat"></button>
+      </div>
+      <div class="sheet-foot">
+        <button id="sheet-device" class="device-btn" aria-label="Output device"><span id="sheet-device-ico" class="ico-sm"></span><span id="sheet-device-label" class="device-label" hidden></span></button>
+        <a href="#/queue" id="sheet-queue" class="icon-btn" aria-label="Queue" data-icon="queue_music"></a>
+        <button id="sheet-download" class="icon-btn" aria-label="Download" data-icon="download"></button>
+      </div>
+    </div>
+  </div>
+  <nav id="tabbar" class="tabbar" aria-label="Main">
+    <a href="#/home" data-route="home"><span class="ico" data-icon="home"></span><span>Home</span></a>
+    <a href="#/library" data-route="library"><span class="ico" data-icon="library_music"></span><span>Your Library</span></a>
+    <a href="#/settings" data-route="settings"><span class="ico" data-icon="settings"></span><span>Settings</span></a>
+    <a href="#/members" data-route="members" class="admin-only" hidden><span class="ico" data-icon="group"></span><span>Members</span></a>
+  </nav>
+
   <div id="menu" class="menu" role="menu" hidden></div>
   <dialog id="dialog">
     <form method="dialog" class="dialog-body">
@@ -86,9 +149,12 @@
       </div>
     </form>
   </dialog>
+  <div id="auth" class="auth" hidden></div>
   <div id="toast" role="status"></div>
   <script src="icons.js"></script>
   <script src="audio.js"></script>
   <script src="app.js"></script>
+  <script src="media.js"></script>
+  <script src="mobile.js"></script>
 </body>
 </html>

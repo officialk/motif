@@ -10,6 +10,12 @@ Repeat: off | all (playlists wrap) | one (the same song again); Shuffle+ ignores
 The browser does the actual playback; when a song's last bar ends it starts
 the prefetched one and tells the server (POST /skip with the id it was playing) and the server
 promotes the prefetched track and starts preparing the one after.
+
+Each user has their own Player (see app/users.py). A player nobody has listened to
+for IDLE_AFTER seconds (no connected page or overlay, and no playback report, skip,
+control call or audio fetch, see Player.activity) parks new prefetch work
+(spec generation and renders) until a client connects again; the song that is
+"now playing" is always prepared.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ log = logging.getLogger("motif.player")
 # (genre or None = let the AI choose, mood, use_ai) -> (spec, source)
 SpecMaker = Callable[[Optional[str], Optional[str], bool], tuple[SongSpec, str]]
 REPEAT_MODES = ("off", "all", "one")
+IDLE_AFTER = 600.0  # seconds without a connected client before prefetching pauses
 
 
 @dataclass
@@ -133,6 +140,10 @@ class Player:
         self.mode = Mode()
         self.stopped = False  # a playlist ended: its first song is cued, paused, until play is pressed
         self._rng = random.Random()
+        self.idle_since: Optional[float] = time.monotonic()  # no client connected since (None = one is)
+        self._parked: dict[str, tuple] = {}  # track id -> (job, args) held back while idle
+        self.access_rev = 0  # bumped when the owner's account changes: open streams re-check access
+        self.closed = False  # the owner was removed: streams end
 
     # --- commands -------------------------------------------------------
 
@@ -397,6 +408,70 @@ class Player:
     def shutdown(self) -> None:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
+    def close(self) -> None:
+        """The owner is gone: end every open stream and stop working."""
+        with self.lock:
+            self.closed = True
+            self._parked.clear()
+            self._changed()
+        self.shutdown()
+
+    def access_changed(self) -> None:
+        """The owner's features changed: streams re-check what they may still do."""
+        with self.lock:
+            self.access_rev += 1
+            self._changed()
+
+    def uses(self, spec_hash: str) -> bool:
+        """Is this song playing or queued here?"""
+        with self.lock:
+            return any(t and t.spec and t.spec.audio_hash() == spec_hash for t in (self.now_playing, self.up_next))
+
+    def hashes(self) -> set[str]:
+        """Audio this player still needs, read without the lock (another player's prune calls it)."""
+        try:
+            tracks = (self.now_playing, self.up_next, *list(self.history))
+        except RuntimeError:  # history changed meanwhile; the next prune catches up
+            return set()
+        return {t.spec.audio_hash() for t in tracks if t is not None and t.spec is not None}
+
+    # --- idle: no client for a while -> no prefetching ------------------------
+
+    def idle(self) -> bool:
+        return self.idle_since is not None and time.monotonic() - self.idle_since > IDLE_AFTER
+
+    def activity(self) -> None:
+        """The user is listening without an open stream (a locked phone keeps playing, reports,
+        skips and fetches audio): restart the idle clock and prepare what was held back."""
+        with self.lock:
+            if self.closed or self.idle_since is None:
+                return  # a client is connected: never idle
+            self.idle_since = time.monotonic()
+            if self._parked:
+                self._resume()
+
+    def _park(self, track: Track, job, *args) -> bool:
+        """Hold back work for a track that isn't playing while nobody listens. True if parked."""
+        with self.lock:
+            if self.closed or (track is not self.now_playing and self.idle()):
+                if not self.closed:
+                    self._parked[track.id] = (job, args)
+                return True
+            return False
+
+    def _resume(self, only: Optional[Track] = None) -> None:
+        """Start parked work again: one track (it became "now"), or what still matters (a client came)."""
+        if only is not None:
+            parked = self._parked.pop(only.id, None)
+            if parked:
+                self.pool.submit(parked[0], only, *parked[1])
+            return
+        parked, self._parked = self._parked, {}
+        for t in (self.now_playing, self.up_next):
+            if t is not None and t.id in parked:
+                job, args = parked[t.id]
+                self.pool.submit(job, t, *args)
+
     # --- live sync (SSE) ----------------------------------------------------
 
     def _changed(self) -> None:
@@ -424,6 +499,8 @@ class Player:
     def connect_client(self, client: str, kind: str, name: Optional[str], audio: bool) -> None:
         """A page or overlay opened its event stream (a client may briefly hold two while reconnecting)."""
         with self.lock:
+            self.idle_since = None
+            self._resume()
             c = self.clients.get(client)
             if c is None:
                 self.clients[client] = {"kind": kind, "name": name, "audio": audio, "since": time.time(), "streams": 1}
@@ -439,6 +516,8 @@ class Player:
             c["streams"] -= 1
             if c["streams"] <= 0:
                 del self.clients[client]
+                if not self.clients:
+                    self.idle_since = time.monotonic()
                 if self.speaker and self.speaker["client"] == client:
                     self.speaker, self.playback = None, None  # a gone client can't play audio
                 self._changed()
@@ -507,6 +586,7 @@ class Player:
                 except Exception:
                     log.exception("history hook failed")
         self.now_playing = track
+        self._resume(track)  # parked as a prefetch while idle: it plays now, so prepare it
         # Prefetch: as soon as a song is chosen, start on the next one.
         self.up_next = self._make_next()
         self._prune()
@@ -581,7 +661,7 @@ class Player:
         return None
 
     def _library_track(self, song_id: str) -> Track | None:
-        """A saved song: rebuilt from its stored spec (audio from cache, S3 media or a fresh render)."""
+        """A saved song: rebuilt from its stored spec (audio from the cache or a fresh render)."""
         if self.library is None:
             return None
         spec, entry = self.library.spec(song_id), self.library.get(song_id)
@@ -616,6 +696,8 @@ class Player:
             self.tracks.popitem(last=False)
 
     def _job(self, track: Track, use_claude: bool) -> None:
+        if self._park(track, self._job, use_claude):
+            return
         try:
             spec, source = self.spec_maker(track.genre, track.mood, use_claude)
             with self.lock:
@@ -632,6 +714,8 @@ class Player:
         self._render_job(track)
 
     def _render_job(self, track: Track) -> None:
+        if self._park(track, self._render_job):
+            return
         try:
             t0 = time.time()
             self.engine.ensure_mp3(track.spec)

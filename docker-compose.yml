@@ -1,9 +1,8 @@
 # Usage: put a General MIDI .sf2 in ./soundfonts, then `docker compose up --build`.
 # The app is published on 127.0.0.1:8000 only.
 #
-# AI backends: the claude-cli backend is not available in the container
-# (no `claude` binary). Use claude-api (ANTHROPIC_API_KEY) or openai
-# (OPENAI_BASE_URL + OPENAI_API_KEY) in .env.
+# AI and S3 backups are set per user in the app (Settings), not here. The claude-cli
+# AI backend is not available in the container (no `claude` binary).
 services:
   motif:
     build: .
@@ -13,18 +12,28 @@ services:
     env_file:
       - path: .env
         required: false
+    # Accounts (see README → Accounts). Set the values in .env; empty admin email = local mode, no login.
+    environment:
+      MOTIF_ADMIN_EMAIL: ${MOTIF_ADMIN_EMAIL:-}
+      MOTIF_ADMIN_PASSWORD: ${MOTIF_ADMIN_PASSWORD:-}
+      MOTIF_PUBLIC_URL: ${MOTIF_PUBLIC_URL:-}
+      MOTIF_SESSION_DAYS: ${MOTIF_SESSION_DAYS:-30}
+      MOTIF_RENDER_WORKERS: ${MOTIF_RENDER_WORKERS:-2}
+      MOTIF_SMTP_HOST: ${MOTIF_SMTP_HOST:-}
+      MOTIF_SMTP_PORT: ${MOTIF_SMTP_PORT:-587}
+      MOTIF_SMTP_USER: ${MOTIF_SMTP_USER:-}
+      MOTIF_SMTP_PASSWORD: ${MOTIF_SMTP_PASSWORD:-}
+      MOTIF_SMTP_FROM: ${MOTIF_SMTP_FROM:-}
+      MOTIF_SMTP_TLS: ${MOTIF_SMTP_TLS:-starttls}
     volumes:
       - ./soundfonts:/soundfonts:ro
       - motif-data:/data
     restart: unless-stopped
 
-  # Optional local S3 for media and DB backups:
+  # Optional local S3 for backups:
   #   docker compose --profile minio up --build
-  # Create the bucket once in the console at http://127.0.0.1:9001, then in .env:
-  #   S3_BUCKET=motif
-  #   S3_ENDPOINT_URL=http://minio:9000
-  #   AWS_ACCESS_KEY_ID=<MINIO_ROOT_USER>
-  #   AWS_SECRET_ACCESS_KEY=<MINIO_ROOT_PASSWORD>
+  # Create a bucket once in the console at http://127.0.0.1:9001, then in Settings → Backups:
+  # endpoint http://minio:9000, that bucket, and MINIO_ROOT_USER / MINIO_ROOT_PASSWORD as keys.
   # Set MINIO_ROOT_USER / MINIO_ROOT_PASSWORD in your shell or in a compose
   # .env file; the defaults below are for local testing only.
   minio:

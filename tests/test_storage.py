@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 from botocore.exceptions import ClientError
 
-from app import config, storage
+from app import storage
+from app.library import Library
 
 
 def _missing(op: str) -> ClientError:
@@ -66,30 +67,17 @@ class FakeS3:
         return resp
 
 
-def make_db(path: Path, marker: str = "one") -> Path:
-    conn = sqlite3.connect(path)
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS songs (id TEXT PRIMARY KEY, name TEXT);
-        CREATE TABLE IF NOT EXISTS playlists (id TEXT PRIMARY KEY, name TEXT);
-        CREATE TABLE IF NOT EXISTS playlist_songs (playlist_id TEXT, song_id TEXT);
-        CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, song_id TEXT);
-        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
-        """
-    )
-    conn.execute("DELETE FROM songs")
-    conn.execute("INSERT INTO songs VALUES ('a', ?)", (marker,))
-    conn.commit()
-    conn.close()
-    return path
+def make_lib(path: Path, spec, marker: str = "one", user: str = "u1") -> Library:
+    """A library with one liked song named `marker` for `user` and one for somebody else."""
+    lib = Library(path)
+    entry, _ = lib.for_user(user).like(spec, "procedural")
+    lib.for_user(user).rename_song(entry["id"], marker)
+    lib.for_user("other").like(spec, "procedural")
+    return lib
 
 
-def song_names(path: Path) -> list[str]:
-    conn = sqlite3.connect(path)
-    try:
-        return [r[0] for r in conn.execute("SELECT name FROM songs")]
-    finally:
-        conn.close()
+def song_names(lib: Library, user: str = "u1") -> list[str]:
+    return [e["name"] for e in lib.for_user(user).entries()]
 
 
 @pytest.fixture()
@@ -97,60 +85,12 @@ def s3() -> FakeS3:
     return FakeS3()
 
 
-def test_local_media_store_is_noop(tmp_path):
-    m = storage.MediaStore()
-    f = tmp_path / "a.mp3"
-    f.write_bytes(b"x")
-    assert m.remote is False
-    m.put(f, "a.mp3")
-    assert m.exists("a.mp3") is False
-    assert m.fetch("a.mp3", tmp_path / "b.mp3") is False
-
-
-def test_media_put_fetch_exists_missing(s3, tmp_path):
-    m = storage.S3MediaStore(s3, "bkt", "motif/")
-    src = tmp_path / "x.mp3"
-    src.write_bytes(b"audio-bytes")
-    assert m.remote is True
-    assert m.exists("x.mp3") is False
-    m.put(src, "x.mp3")
-    assert "motif/media/x.mp3" in s3.objects
-    assert s3.extra["motif/media/x.mp3"]["ContentType"] == "audio/mpeg"
-    wav = tmp_path / "x.wav"
-    wav.write_bytes(b"w")
-    m.put(wav, "x.wav")
-    assert s3.extra["motif/media/x.wav"]["ContentType"] == "audio/wav"
-    assert m.exists("x.mp3") is True
-
-    dest = tmp_path / "out" / "got.mp3"
-    assert m.fetch("x.mp3", dest) is True
-    assert dest.read_bytes() == b"audio-bytes"
-    assert [p.name for p in dest.parent.iterdir()] == ["got.mp3"]  # no temp left
-
-    missing = tmp_path / "nope.mp3"
-    assert m.fetch("nope.mp3", missing) is False
-    assert not missing.exists()
-    assert list(tmp_path.glob("nope.mp3*")) == []
-
-
-def test_media_fetch_other_error_returns_false(tmp_path):
-    class Boom(FakeS3):
-        def download_file(self, *a, **k):
-            raise ClientError({"Error": {"Code": "500", "Message": "boom"}}, "GetObject")
-
-    m = storage.S3MediaStore(Boom(), "bkt", "p/")
-    assert m.fetch("a.mp3", tmp_path / "a.mp3") is False
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_backup_snapshot_while_db_open(s3, tmp_path):
-    db = make_db(tmp_path / "live.db")
-    holder = sqlite3.connect(db)
-    holder.execute("INSERT INTO songs VALUES ('b', 'two')")
-    holder.commit()
-    holder.execute("SELECT * FROM songs").fetchall()  # keep connection active
+def test_backup_snapshot_while_db_open_holds_only_that_user(s3, tmp_path, spec):
+    lib = make_lib(tmp_path / "lib", spec)
+    holder = sqlite3.connect(lib.db_path)
+    holder.execute("SELECT * FROM songs").fetchall()  # keep a connection active
     store = storage.BackupStore(s3, "bkt", "motif/")
-    info = store.backup(db)
+    info = store.backup(lib.db, "u1")
     holder.close()
     assert info["key"].startswith("motif/backups/motif-") and info["key"].endswith(".db")
     assert info["size"] > 0 and isinstance(info["created"], float)
@@ -161,7 +101,8 @@ def test_backup_snapshot_while_db_open(s3, tmp_path):
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert set(storage.REQUIRED_TABLES) <= names
-    assert conn.execute("SELECT count(*) FROM songs").fetchone()[0] == 2
+    assert conn.execute("SELECT user_id, name FROM songs").fetchall() == [("u1", "one")]
+    assert conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0  # never accounts
     conn.close()
 
 
@@ -181,42 +122,42 @@ def test_list_newest_first_with_pagination(tmp_path):
     assert [i["size"] for i in items] == [5, 4, 3, 2, 1]
 
 
-def test_restore_replaces_content_visible_to_open_connection(s3, tmp_path):
-    db = make_db(tmp_path / "live.db", "original")
+def test_restore_replaces_content_visible_to_open_connection(s3, tmp_path, spec):
+    lib = make_lib(tmp_path / "lib", spec, "original")
     store = storage.BackupStore(s3, "bkt", "motif/")
-    info = store.backup(db)
+    info = store.backup(lib.db, "u1")
 
-    reader = sqlite3.connect(db)
-    w = sqlite3.connect(db)
-    w.execute("UPDATE songs SET name='changed'")
-    w.commit()
-    w.close()
-    assert reader.execute("SELECT name FROM songs").fetchone()[0] == "changed"
+    reader = sqlite3.connect(lib.db_path)
+    lib.for_user("u1").rename_song(spec.audio_hash(), "changed")
+    lib.for_user("other").rename_song(spec.audio_hash(), "theirs")
+    q = "SELECT name FROM songs WHERE user_id = 'u1'"
+    assert reader.execute(q).fetchone()[0] == "changed"
 
-    store.restore(info["key"], db)
-    assert reader.execute("SELECT name FROM songs").fetchone()[0] == "original"
+    assert store.restore(info["key"], lib.db, "u1")["songs"] == 1
+    assert reader.execute(q).fetchone()[0] == "original"
     reader.close()
-    assert song_names(db) == ["original"]
+    assert song_names(lib) == ["original"] and song_names(lib, "other") == ["theirs"]  # only u1's rows
 
 
-def test_restore_rejections_leave_live_db_untouched(s3, tmp_path):
-    db = make_db(tmp_path / "live.db", "keep")
+def test_restore_rejections_leave_live_db_untouched(s3, tmp_path, spec):
+    lib = make_lib(tmp_path / "lib", spec, "keep")
+    db = lib.db
     store = storage.BackupStore(s3, "bkt", "motif/")
 
     s3.objects["motif/media/x.db"] = {"body": b"x", "modified": datetime.now(timezone.utc)}
     with pytest.raises(storage.StorageError):
-        store.restore("motif/media/x.db", db)
+        store.restore("motif/media/x.db", db, "u1")
     with pytest.raises(storage.StorageError):
-        store.restore("other/backups/motif-1.db", db)
+        store.restore("other/backups/motif-1.db", db, "u1")
     with pytest.raises(storage.StorageError):
-        store.restore("motif/backups/../media/x.db", db)
+        store.restore("motif/backups/../media/x.db", db, "u1")
 
     s3.objects["motif/backups/motif-20260101-000000.db"] = {
         "body": b"this is not sqlite" * 50,
         "modified": datetime.now(timezone.utc),
     }
     with pytest.raises(storage.StorageError, match="SQLite"):
-        store.restore("motif/backups/motif-20260101-000000.db", db)
+        store.restore("motif/backups/motif-20260101-000000.db", db, "u1")
 
     bad = tmp_path / "bad.db"
     c = sqlite3.connect(bad)
@@ -228,18 +169,18 @@ def test_restore_rejections_leave_live_db_untouched(s3, tmp_path):
         "modified": datetime.now(timezone.utc),
     }
     with pytest.raises(storage.StorageError, match="missing tables"):
-        store.restore("motif/backups/motif-20260102-000000.db", db)
+        store.restore("motif/backups/motif-20260102-000000.db", db, "u1")
 
     with pytest.raises(storage.StorageError, match="not found"):
-        store.restore("motif/backups/motif-nope.db", db)
+        store.restore("motif/backups/motif-nope.db", db, "u1")
 
-    assert song_names(db) == ["keep"]
+    assert song_names(lib) == ["keep"]
 
 
-def test_scheduler_runs_and_stops(s3, tmp_path):
-    db = make_db(tmp_path / "live.db")
+def test_scheduler_runs_and_stops(s3, tmp_path, spec):
+    lib = make_lib(tmp_path / "lib", spec)
     store = storage.BackupStore(s3, "bkt", "motif/")
-    sched = storage.BackupScheduler(store, db, 0.00001)  # ~36 ms
+    sched = storage.BackupScheduler(store, lib.db, "u1", 0.00001)  # ~36 ms
     sched.start()
     deadline = time.time() + 5
     while time.time() < deadline and not any("/backups/" in k for k in s3.objects):
@@ -255,11 +196,11 @@ def test_scheduler_survives_failures(tmp_path):
     class Failing:
         calls = 0
 
-        def backup(self, db_path):
+        def backup(self, db, user_id):
             Failing.calls += 1
             raise storage.StorageError("nope")
 
-    sched = storage.BackupScheduler(Failing(), tmp_path / "x.db", 0.00001)
+    sched = storage.BackupScheduler(Failing(), tmp_path / "x.db", "u1", 0.00001)
     sched.start()
     deadline = time.time() + 5
     while time.time() < deadline and Failing.calls < 2:
@@ -269,19 +210,21 @@ def test_scheduler_survives_failures(tmp_path):
     assert Failing.calls >= 2 and not sched.is_alive()
 
 
-def test_from_config_disabled_and_enabled(monkeypatch, s3):
-    monkeypatch.setattr(config, "S3_BUCKET", "")
-    media, backups = storage.from_config(s3)
-    assert type(media) is storage.MediaStore and backups is None
+def test_from_settings_disabled_and_enabled(s3):
+    assert storage.from_settings(storage.BackupSettings(bucket=""), client=s3) is None
+    store = storage.from_settings(storage.BackupSettings(bucket="bkt", prefix="pre"), client=s3)
+    assert isinstance(store, storage.BackupStore) and store.prefix == "pre/" and store.client is s3
+    assert store.backup_prefix == "pre/backups/"
 
-    monkeypatch.setattr(config, "S3_BUCKET", "bkt")
-    monkeypatch.setattr(config, "S3_PREFIX", "pre/")
-    monkeypatch.setattr(config, "S3_MEDIA", True)
-    media, backups = storage.from_config(s3)
-    assert isinstance(media, storage.S3MediaStore) and media.remote
-    assert media.key("a.mp3") == "pre/media/a.mp3"
-    assert isinstance(backups, storage.BackupStore) and backups.prefix == "pre/"
 
-    monkeypatch.setattr(config, "S3_MEDIA", False)
-    media, backups = storage.from_config(s3)
-    assert type(media) is storage.MediaStore and backups is not None
+def test_s3_client_needs_the_users_own_keys(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "env-is-never-used")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "env-is-never-used")
+    with pytest.raises(storage.StorageError, match="access key"):
+        storage.s3_client(storage.BackupSettings(bucket="bkt"))
+
+
+def test_saved_settings_ignore_old_fields():
+    s = storage.BackupSettings.load({"bucket": "bkt", "media": True, "prefix": "x"})
+    assert s.enabled and s.prefix == "x/"
+    assert storage.BackupSettings.load({"bucket": "a b"}).enabled is False  # invalid -> defaults

@@ -51,7 +51,8 @@ def test_key_lifecycle_and_scopes(client):
     assert client.post("/prompt", json={"text": "x"}, headers=auth(token)).status_code == 403  # no request scope
     for method, path in (("GET", "/settings"), ("GET", "/settings/keys"), ("POST", "/settings/keys"),
                          ("DELETE", "/library/0123456789abcdef"), ("POST", "/download/x"),
-                         ("PUT", "/settings/ai"), ("POST", "/admin/backup")):
+                         ("PUT", "/settings/ai"), ("POST", "/backups"), ("GET", "/backups"),
+                         ("POST", "/backups/restore"), ("GET", "/users"), ("POST", "/users/invite")):
         assert client.request(method, path, headers=auth(token), json={}).status_code == 403, path
     assert client.get("/state", headers=auth("mk_wrong")).status_code == 401
     assert client.get("/state", headers={"Authorization": "Basic abc"}).status_code == 401

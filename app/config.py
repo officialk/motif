@@ -1,7 +1,7 @@
 """Paths and environment settings.
 
-Secrets (API keys, AWS credentials) are only ever read from the environment by
-the client libraries that need them; nothing here stores or logs them.
+Nothing here is a secret except the admin and SMTP passwords; AI and S3 keys are
+entered per user in the app and stored encrypted (app/credentials.py).
 """
 
 from __future__ import annotations
@@ -25,34 +25,28 @@ PORT = int(os.environ.get("MOTIF_PORT", "8000"))
 # (DNS rebinding) or a foreign Origin on POST/PUT/PATCH/DELETE (cross-site requests) are refused.
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get("MOTIF_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",") if h.strip()]
 
+# Accounts: with an admin email set the app needs a login (the admin is created/updated from these
+# on every start); unset = local mode, one built-in user and no login.
+ADMIN_EMAIL = os.environ.get("MOTIF_ADMIN_EMAIL", "").strip().lower() or None
+ADMIN_PASSWORD = os.environ.get("MOTIF_ADMIN_PASSWORD", "") or None
+PUBLIC_URL = os.environ.get("MOTIF_PUBLIC_URL", "").strip().rstrip("/") or None  # base for links in emails
+SESSION_DAYS = float(os.environ.get("MOTIF_SESSION_DAYS") or "30")
+RENDER_WORKERS = int(os.environ.get("MOTIF_RENDER_WORKERS") or "2")  # concurrent renders across all players
+
+# Outgoing mail for invites and password resets. No host = links are shown to the admin instead.
+SMTP_HOST = os.environ.get("MOTIF_SMTP_HOST", "").strip() or None
+SMTP_PORT = int(os.environ.get("MOTIF_SMTP_PORT") or "587")
+SMTP_USER = os.environ.get("MOTIF_SMTP_USER", "") or None
+SMTP_PASSWORD = os.environ.get("MOTIF_SMTP_PASSWORD", "") or None
+SMTP_FROM = os.environ.get("MOTIF_SMTP_FROM", "").strip() or None
+SMTP_TLS = (os.environ.get("MOTIF_SMTP_TLS") or "starttls").strip().lower()  # starttls | ssl | none
+
 SAMPLE_RATE = 44100
 CACHE_MAX_SONGS = int(os.environ.get("MOTIF_CACHE_MAX", "12"))  # ~50 MB each (WAV + MP3)
 
 
-def _backend_default() -> str:
-    # CLAUDE_BACKEND=cli|api is still accepted for older setups.
-    legacy = {"cli": "claude-cli", "api": "claude-api"}.get(os.environ.get("CLAUDE_BACKEND", "").strip().lower())
-    return os.environ.get("AI_BACKEND", legacy or "off").strip().lower()
-
-
-# AI brief generation. Backends: off | claude-cli | claude-api | openai (any OpenAI-compatible server).
-AI_BACKEND = _backend_default()
-AI_RATIO = float(os.environ.get("AI_RATIO", os.environ.get("CLAUDE_RATIO", "0.25")))
-AI_TIMEOUT = float(os.environ.get("AI_TIMEOUT", os.environ.get("CLAUDE_TIMEOUT", "20")))
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
-CLAUDE_CLI = os.environ.get("CLAUDE_CLI", "claude")
-CLAUDE_CLI_MODEL = os.environ.get("CLAUDE_CLI_MODEL", "haiku")
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_JSON_MODE = os.environ.get("OPENAI_JSON_MODE", "1") != "0"
-
-# S3-compatible storage (AWS S3, MinIO, Cloudflare R2, ...). Empty bucket = local only.
-S3_BUCKET = os.environ.get("S3_BUCKET", "")
-S3_PREFIX = os.environ.get("S3_PREFIX", "motif/")
-S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL") or None
-S3_REGION = os.environ.get("S3_REGION") or None
-S3_MEDIA = os.environ.get("S3_MEDIA", "1") != "0"  # store saved/exported songs' audio in S3
-S3_BACKUP_INTERVAL_HOURS = float(os.environ.get("S3_BACKUP_INTERVAL_HOURS", "0"))  # 0 = manual only
+# AI briefs and S3 backups have no environment settings: every user sets their own in the app
+# (Settings -> AI, Settings -> Backups), with keys encrypted in the database (app/credentials.py).
 
 
 def find_soundfont() -> Path:

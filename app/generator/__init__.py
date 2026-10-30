@@ -19,8 +19,9 @@ def clean_mood(mood: Optional[str]) -> Optional[str]:
     return text or None
 
 
-def make_spec(genre: Optional[str], mood: Optional[str], use_claude: bool) -> tuple[SongSpec, str]:
-    """Returns (spec, source). AI is used only when asked for and a backend is configured."""
+def make_spec(genre: Optional[str], mood: Optional[str], use_claude: bool,
+              settings=None, creds=None) -> tuple[SongSpec, str]:
+    """Returns (spec, source). AI is used only when asked for and the user's backend is configured."""
     from app.generator import ai
 
-    return ai.make_spec(genre, mood, use_claude)
+    return ai.make_spec(genre, mood, use_claude, settings, creds)

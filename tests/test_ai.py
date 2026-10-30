@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from app import config
+from app import credentials
 from app.generator import ai, clean_mood, make_spec, procedural
 from app.generator.brief import SongBrief, clamp_brief_dict
 
@@ -24,11 +24,17 @@ def settings(backend="claude-cli", **kw) -> ai.AISettings:
     return ai.AISettings(backend=backend, **kw)
 
 
-@pytest.fixture(autouse=True)
-def isolated_settings():
-    old = ai._settings
-    yield
-    ai._settings = old
+CLI = settings("claude-cli")
+
+
+class Keys:
+    """A user's saved keys as the AI layer reads them."""
+
+    def __init__(self, **values):
+        self.values = values
+
+    def get(self, name):
+        return self.values.get(name)
 
 
 @pytest.fixture
@@ -42,14 +48,13 @@ def fake_backend(monkeypatch):
                 raise exc
             return reply
         monkeypatch.setitem(ai.BACKENDS, backend, fn)
-        ai.set_settings(settings(backend))
         return calls
     return install
 
 
 def test_valid_reply_used(fake_backend):
     fake_backend(reply="Here you go:\n```json\n" + good_reply() + "\n```")
-    spec, source = make_spec("jazz", "smoky", True)
+    spec, source = make_spec("jazz", "smoky", True, CLI)
     assert source == "claude" and spec.name == "AI Test Tune"
     assert spec.key == "D" and spec.scale == "dorian" and spec.instruments.lead == 65
     assert spec.seed != 99  # the server picks the seed, never the AI
@@ -57,7 +62,7 @@ def test_valid_reply_used(fake_backend):
 
 def test_requested_genre_wins_and_values_clamped(fake_backend):
     fake_backend(reply=good_reply(genre="jazz", tempo=999, energy=5, density=-3, seed=2**40))
-    spec, source = make_spec("techno", None, True)
+    spec, source = make_spec("techno", None, True, CLI)
     assert source == "claude"
     assert spec.genre == "techno" and spec.tempo == 136 and 0 <= spec.seed < 2**31
 
@@ -74,42 +79,42 @@ def test_requested_genre_wins_and_values_clamped(fake_backend):
 def test_bad_reply_falls_back_to_procedural(fake_backend, caplog, reply):
     fake_backend(reply=reply)
     with caplog.at_level(logging.WARNING, logger="motif.ai"):
-        spec, source = make_spec("jazz", "x", True)
+        spec, source = make_spec("jazz", "x", True, CLI)
     assert source == "procedural" and spec.genre == "jazz"
     assert "falling back to procedural" in caplog.text
 
 
 def test_backend_error_falls_back(fake_backend):
     fake_backend(exc=ai.AIError("claude CLI timed out after 20s"))
-    assert make_spec("lofi", None, True)[1] == "procedural"
+    assert make_spec("lofi", None, True, CLI)[1] == "procedural"
 
 
 def test_off_backend_never_calls_ai(fake_backend):
     calls = fake_backend(reply=good_reply())
-    ai.set_settings(settings("off"))
-    assert make_spec("lofi", "rainy", True)[1] == "procedural"
+    assert make_spec("lofi", "rainy", True, settings("off"))[1] == "procedural"
+    assert make_spec("lofi", "rainy", True)[1] == "procedural"  # no settings = AI off
     assert calls == []
-    ai.set_settings(settings("claude-cli"))
-    assert make_spec("jazz", "rainy", True)[1] == "claude"
-    assert make_spec("jazz", "rainy", False)[1] == "procedural"
+    assert make_spec("jazz", "rainy", True, CLI)[1] == "claude"
+    assert make_spec("jazz", "rainy", False, CLI)[1] == "procedural"
     assert len(calls) == 1
 
 
 def test_genre_none_lets_ai_choose(fake_backend):
     fake_backend(reply=good_reply(genre="techno"))
-    spec, source = make_spec(None, "warehouse", True)
+    spec, source = make_spec(None, "warehouse", True, CLI)
     assert source == "claude" and spec.genre == "techno"
 
 
 def test_genre_none_without_brief_genre_falls_back_to_keywords(fake_backend):
     fake_backend(reply=good_reply(genre=None))
-    spec, source = make_spec(None, "some jazz lounge", True)
+    spec, source = make_spec(None, "some jazz lounge", True, CLI)
     assert source == "procedural" and spec.genre == "jazz"
-    ai.set_settings(settings("off"))
-    assert make_spec(None, "8-bit arcade", True)[0].genre == "chiptune"
+    assert make_spec(None, "8-bit arcade", True, settings("off"))[0].genre == "chiptune"
     with pytest.raises(ai.AIError):
         fake_backend(reply=good_reply(genre=None))
-        ai.generate_brief(None, "x")
+        ai.generate_brief(None, "x", CLI)
+    with pytest.raises(ai.AIError, match="off"):
+        ai.generate_brief("jazz", "x")
 
 
 def test_same_brief_same_spec():
@@ -157,17 +162,16 @@ def test_cli_backend_reads_stdin_and_parses(tmp_path, monkeypatch):
 prompt = sys.stdin.read()
 assert "-p" in sys.argv and "--tools" in sys.argv and "--model" in sys.argv and "REQUEST_DATA" in prompt
 print({out!r})""")
-    monkeypatch.setattr(config, "CLAUDE_CLI", str(script))
+    monkeypatch.setattr(ai, "CLAUDE_CLI", str(script))
     brief, source = ai.generate_brief("house", "warm", settings("claude-cli"))
     assert source == "claude" and brief.genre == "house"
 
 
 def test_cli_timeout_falls_back(tmp_path, monkeypatch):
     script = _fake_cli(tmp_path, "import time; time.sleep(10)")
-    monkeypatch.setattr(config, "CLAUDE_CLI", str(script))
-    ai.set_settings(settings("claude-cli", timeout=1))
+    monkeypatch.setattr(ai, "CLAUDE_CLI", str(script))
     t = time.time()
-    spec, source = make_spec("lofi", None, True)
+    spec, source = make_spec("lofi", None, True, settings("claude-cli", timeout=1))
     assert source == "procedural" and time.time() - t < 5
 
 
@@ -182,15 +186,15 @@ def test_claude_api_backend(monkeypatch):
             return SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text=good_reply(genre="chiptune"))])
 
     class FakeClient:
-        def __init__(self, timeout, max_retries):
-            seen["timeout"], seen["max_retries"] = timeout, max_retries
+        def __init__(self, timeout, max_retries, api_key=None):
+            seen["timeout"], seen["max_retries"], seen["api_key"] = timeout, max_retries, api_key
             self.messages = FakeMessages()
 
     monkeypatch.setattr(anthropic, "Anthropic", FakeClient)
-    ai.set_settings(settings("claude-api", timeout=7))
-    spec, source = make_spec("chiptune", None, True)
-    assert source == "claude"
-    assert seen["model"] == config.CLAUDE_MODEL and seen["timeout"] == 7 and seen["max_retries"] == 0
+    spec, source = make_spec("chiptune", None, True, settings("claude-api", timeout=7),
+                             Keys(anthropic_api_key="ak-user"))
+    assert source == "claude" and seen["api_key"] == "ak-user"  # the caller's own key
+    assert seen["model"] == ai.CLAUDE_MODEL and seen["timeout"] == 7 and seen["max_retries"] == 0
     assert seen["system"] == ai.SYSTEM and seen["max_tokens"] == 3000  # room for a playlist of briefs
 
 
@@ -202,8 +206,7 @@ def test_claude_api_refusal_falls_back(monkeypatch):
             self.messages = SimpleNamespace(create=lambda **k: SimpleNamespace(stop_reason="refusal", content=[]))
 
     monkeypatch.setattr(anthropic, "Anthropic", FakeClient)
-    ai.set_settings(settings("claude-api"))
-    assert make_spec("chiptune", None, True)[1] == "procedural"
+    assert make_spec("chiptune", None, True, settings("claude-api"))[1] == "procedural"
 
 
 class FakeHTTP:
@@ -221,11 +224,9 @@ class FakeHTTP:
 
 
 def test_openai_backend_request_shape(monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "dummy-test-value")
-    monkeypatch.setattr(config, "OPENAI_JSON_MODE", True)
     http = FakeHTTP(monkeypatch)
     s = settings("openai", base_url="http://localhost:11434/v1/", openai_model="llama3", timeout=9)
-    brief, source = ai.generate_brief("jazz", "smoky", s)
+    brief, source = ai.generate_brief("jazz", "smoky", s, Keys(openai_api_key="dummy-test-value"))
     assert source == "openai" and brief.name == "AI Test Tune"
     c = http.calls[0]
     assert c.url == "http://localhost:11434/v1/chat/completions"
@@ -236,15 +237,15 @@ def test_openai_backend_request_shape(monkeypatch):
 
 
 def test_openai_no_auth_header_without_key(monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    http = FakeHTTP(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "env-is-never-used")
+    http = FakeHTTP(monkeypatch, statuses=(200, 200))
     ai.generate_brief("jazz", None, settings("openai"))
-    assert "Authorization" not in http.calls[0].headers
-    assert http.calls[0].json["model"] == config.OPENAI_MODEL
+    ai.generate_brief("jazz", None, settings("openai"), Keys())
+    assert all("Authorization" not in c.headers for c in http.calls)
+    assert http.calls[0].json["model"] == ai.OPENAI_MODEL
 
 
 def test_openai_retries_without_response_format_on_400(monkeypatch):
-    monkeypatch.setattr(config, "OPENAI_JSON_MODE", True)
     http = FakeHTTP(monkeypatch, statuses=(400, 200))
     ai.generate_brief("jazz", None, settings("openai"))
     assert len(http.calls) == 2
@@ -253,8 +254,7 @@ def test_openai_retries_without_response_format_on_400(monkeypatch):
 
 def test_openai_errors_fall_back(monkeypatch):
     http = FakeHTTP(monkeypatch, statuses=(500,))
-    ai.set_settings(settings("openai"))
-    assert make_spec("jazz", None, True)[1] == "procedural"
+    assert make_spec("jazz", None, True, settings("openai"))[1] == "procedural"
 
     def boom(*a, **k):
         raise httpx.ConnectTimeout("slow")
@@ -262,7 +262,7 @@ def test_openai_errors_fall_back(monkeypatch):
     with pytest.raises(ai.AIError, match="timed out"):
         ai.generate_brief("jazz", None, settings("openai"))
     FakeHTTP(monkeypatch, content="no json here")
-    assert make_spec("jazz", None, True)[1] == "procedural"
+    assert make_spec("jazz", None, True, settings("openai"))[1] == "procedural"
     assert http.calls
 
 
@@ -271,33 +271,29 @@ def test_settings_validation():
         with pytest.raises(ValueError):
             ai.AISettings(**bad)
     assert ai.AISettings(backend="OpenAI").backend == "openai"
-    assert isinstance(ai.AISettings.from_config(), ai.AISettings)
+    assert ai.AISettings().backend == "off"  # every user starts with AI off
 
 
-def test_public_never_exposes_key_values(monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "super-secret-dummy")
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    pub = settings("openai").public()
-    assert pub["keys"] == {"anthropic": {"set": False, "source": None}, "openai": {"set": True, "source": "env"}}
+def test_public_never_exposes_key_values(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "env-is-never-used")
+    keys = credentials.Credentials(tmp_path / "x.db").for_user("u1")
+    keys.update({"openai_api_key": "super-secret-dummy"})
+    pub = settings("openai").public(keys)
+    assert pub["keys"] == {"anthropic": {"set": False, "source": None}, "openai": {"set": True, "source": "settings"}}
     assert "super-secret-dummy" not in json.dumps(pub)
     assert pub["backends"] == ["off", "claude-cli", "claude-api", "openai"]
-    assert pub["openai_model"] == config.OPENAI_MODEL and pub["model"] == config.CLAUDE_MODEL
-
-
-def test_get_set_settings():
-    s = settings("openai", ratio=0.5)
-    ai.set_settings(s)
-    assert ai.get_settings() is s
+    assert pub["openai_model"] == ai.OPENAI_MODEL and pub["model"] == ai.CLAUDE_MODEL
 
 
 def test_test_backend(fake_backend):
     fake_backend(reply=good_reply(genre="lofi"))
-    r = ai.test_backend()
+    r = ai.test_backend(CLI)
     assert r["ok"] and r["source"] == "claude" and r["brief"]["genre"] == "lofi"
     fake_backend(exc=ai.AIError("nope"))
-    r = ai.test_backend()
+    r = ai.test_backend(CLI)
     assert not r["ok"] and r["error"] == "nope"
     assert not ai.test_backend(settings("off"))["ok"]
+    assert not ai.test_backend()["ok"]
 
 
 def test_playlist_falls_back_to_procedural_when_ai_fails(monkeypatch):
@@ -305,20 +301,15 @@ def test_playlist_falls_back_to_procedural_when_ai_fails(monkeypatch):
         raise ai.AIError("down")
 
     monkeypatch.setitem(ai.BACKENDS, "openai", broken)
-    ai.set_settings(settings("openai"))
-    try:
-        title, songs = ai.make_playlist(None, "slow piano for reading", 5)
-    finally:
-        ai.set_settings(ai.AISettings.from_config())
+    title, songs = ai.make_playlist(None, "slow piano for reading", 5, settings=settings("openai"))
     assert title == "Slow piano for reading" and len(songs) == 5
     assert {s.genre for s, _ in songs} == {"classical-piano"} and {src for _, src in songs} == {"procedural"}
     assert len({s.audio_hash() for s, _ in songs}) == 5
 
 
-
 def test_seed_is_never_the_ais_and_not_asked_for(fake_backend):
     calls = fake_backend(reply=good_reply(seed=7))
-    seeds = {make_spec("jazz", None, True)[0].seed for _ in range(5)}
+    seeds = {make_spec("jazz", None, True, CLI)[0].seed for _ in range(5)}
     assert 7 not in seeds and len(seeds) == 5  # fresh random seed each time
     assert '"seed"' not in calls[0][0].split("CONSTRAINTS")[0]  # not in the schema shown to the AI
 
@@ -331,11 +322,7 @@ def test_per_song_mood_and_styles_reach_the_song(fake_backend):
         {"genre": "lofi", "mood": "soft flute", "drums": True},
     ]}
     fake_backend(reply=_json.dumps(reply))
-    ai.set_settings(settings("claude-cli"))
-    try:
-        title, songs = ai.make_playlist(None, "rainy evening", 3)
-    finally:
-        ai.set_settings(ai.AISettings.from_config())
+    title, songs = ai.make_playlist(None, "rainy evening", 3, settings=CLI)
     specs = [s for s, _ in songs]
     assert title == "Rain Walk" and [s.genre for s in specs] == ["jazz", "ambient", "lofi"]
     assert specs[0].instruments.lead == 66  # "tenor sax" from that song's own mood

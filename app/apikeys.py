@@ -7,7 +7,8 @@ stored; the token has 256 bits of entropy, so a fast hash is fine):
 - Overlay keys (`mo_…`) for overlay pages: they play the audio and show what's
   playing (the `speaker` scope) and nothing else. Only overlay keys open an overlay.
 
-Settings, admin and library edits are never reachable with a key.
+Settings, admin and library edits are never reachable with a key. Every key
+belongs to the user who made it and acts as that user (their player and library).
 """
 
 from __future__ import annotations
@@ -80,7 +81,7 @@ class ApiKeys:
                 "kind": row["kind"], "prefix": row["prefix"], "created": row["created"],
                 "last_used": row["last_used"]}
 
-    def create(self, name: str, scopes: list[str], kind: str = "api") -> tuple[dict, str]:
+    def create(self, name: str, scopes: list[str], kind: str = "api", user_id: str = "local") -> tuple[dict, str]:
         name = " ".join(str(name).split())[:60]
         if not name:
             raise ValueError("name can't be empty")
@@ -96,18 +97,18 @@ class ApiKeys:
         row = {"id": uuid.uuid4().hex[:10], "name": name, "hash": _hash(token), "scopes": ",".join(scopes),
                "prefix": token[:7], "created": time.time(), "last_used": None, "kind": kind}
         with self.db.connect() as db:
-            db.execute("INSERT INTO api_keys (id, name, hash, scopes, prefix, created, last_used, kind) "
-                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", tuple(row.values()))
+            db.execute("INSERT INTO api_keys (id, name, hash, scopes, prefix, created, last_used, kind, user_id) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (*row.values(), user_id))
         return self._public(row), token
 
-    def list(self) -> list[dict]:
+    def list(self, user_id: str = "local") -> list[dict]:
         with self.db.connect() as db:
-            rows = db.execute("SELECT * FROM api_keys ORDER BY created").fetchall()
+            rows = db.execute("SELECT * FROM api_keys WHERE user_id = ? ORDER BY created", (user_id,)).fetchall()
         return [self._public(r) for r in rows]
 
-    def revoke(self, key_id: str) -> bool:
+    def revoke(self, key_id: str, user_id: str = "local") -> bool:
         with self.db.connect() as db:
-            gone = db.execute("DELETE FROM api_keys WHERE id = ?", (key_id,)).rowcount > 0
+            gone = db.execute("DELETE FROM api_keys WHERE id = ? AND user_id = ?", (key_id, user_id)).rowcount > 0
         if gone:
             self.revoked.add(key_id)
         return gone
@@ -130,7 +131,7 @@ class ApiKeys:
             if now - self._used.get(row["id"], 0) > LAST_USED_EVERY:
                 self._used[row["id"]] = now
                 db.execute("UPDATE api_keys SET last_used = ? WHERE id = ?", (now, row["id"]))
-        return self._public(row)
+        return {**self._public(row), "user_id": row["user_id"]}
 
     def allow(self, key_id: str, scope: str) -> bool:
         """Sliding-window rate limit per key and scope (only control and request are limited)."""

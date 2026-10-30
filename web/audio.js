@@ -180,24 +180,53 @@ class WebAudioOut {
   }
 }
 
-// ---------- audio output: <audio> fallback (small gap between songs) ----------
-// With extra headers the file is fetched first and played from a blob URL.
+// ---------- audio output: one <audio> element (small gap between songs) ----------
+// Used where Web Audio can't keep playing in the background (phones: iOS suspends an
+// AudioContext on lock, and lock-screen controls attach to media elements only).
+// Songs are fetched ahead into blob URLs, so when a song ends the next one starts from
+// memory inside the element's own events (timers are frozen on a locked phone).
+// Hooks: onTime() on timeupdate/ended, onPausedOutside() when the system paused it
+// (headphones out, a call, the lock screen without a handler).
 class ElementOut {
   constructor(headers) {
     this.gapless = false;
     this.headers = headers || {};
     this.el = new Audio();
+    this.el.preload = "auto";
+    this.el.playsInline = true;
     this.loading = new Map(); // id -> Promise<url>
     this.ready = new Map();   // id -> url
     this.cur = null;
     this.pending = null;
+    this.switching = false;   // a src change is in progress: its pause/abort events are ours
+    this.wanted = false;      // we asked it to play (and haven't paused it ourselves)
+    this.unlocked = false;
+    this.onTime = null;
+    this.onPausedOutside = null;
+    this.el.addEventListener("timeupdate", () => this.onTime?.());
+    this.el.addEventListener("ended", () => this.onTime?.());
+    this.el.addEventListener("playing", () => { this.switching = false; });
+    this.el.addEventListener("pause", () => {
+      if (this.switching || this.el.ended || !this.wanted) return;
+      this.wanted = false;
+      this.onPausedOutside?.();
+    });
+  }
+
+  // Call synchronously inside a click: iOS only lets an element start later (after a fetch,
+  // or at the end of a song while locked) once it has played from a user gesture.
+  unlock() {
+    if (this.unlocked || this.cur) return;
+    this.unlocked = true;
+    this.el.src = SILENCE_WAV;
+    // Our own pause of the silence must not read as "paused from outside" (it would leave the app paused).
+    this.el.play().then(() => { if (!this.cur) { this.switching = true; this.el.pause(); } }).catch(() => { this.unlocked = false; });
   }
   static sinkSupported() { return typeof HTMLMediaElement !== "undefined" && typeof HTMLMediaElement.prototype.setSinkId === "function"; }
   setSink(id) { return this.el.setSinkId(id || ""); }
   load(track) {
-    if (!Object.keys(this.headers).length) { this.ready.set(track.id, track.mp3); return Promise.resolve(track.mp3); }
     if (!this.loading.has(track.id)) {
-      const p = fetch(track.mp3, { headers: this.headers })
+      const p = fetch(track.mp3, { headers: this.headers, credentials: "same-origin" })
         .then((r) => { if (!r.ok) throw new Error(`audio ${r.status}`); return r.blob(); })
         .then((b) => { const u = URL.createObjectURL(b); this.ready.set(track.id, u); return u; });
       p.catch(() => this.loading.delete(track.id));
@@ -219,8 +248,10 @@ class ElementOut {
   }
   buffer(id) { return this.ready.get(id) || null; }
   playNow(track, url) {
+    this.switching = true;
+    this.wanted = true;
     this.el.src = url;
-    this.el.play().catch(() => {});
+    this.el.play().catch(() => { this.switching = false; });
     this.cur = { id: track.id, music: track.music_seconds, start: 0, track };
   }
   promote() { return false; }
@@ -231,11 +262,13 @@ class ElementOut {
     return { t: this.el.currentTime, music: this.cur.music, track: this.cur.track };
   }
   setVolume(v) { this.el.volume = v; }
-  pause() { this.el.pause(); return Promise.resolve(); }
-  resume() { return this.el.play(); }
+  pause() { this.wanted = false; this.el.pause(); return Promise.resolve(); }
+  resume() { this.wanted = true; return this.el.play(); }
   get paused() { return this.el.paused; }
   get blocked() { return false; }
   destroy() {
+    this.wanted = false;
+    this.onTime = this.onPausedOutside = null;
     this.el.pause();
     this.el.removeAttribute("src");
     this.el.load();
@@ -248,20 +281,48 @@ class ElementOut {
 
 const OutClass = (window.AudioContext || window.webkitAudioContext) ? WebAudioOut : ElementOut;
 
+// The site's speaker output. Phones and tablets play through one <audio> element: it keeps
+// playing (and moving to the next song) with the screen locked and owns the lock-screen /
+// notification controls. Desktops keep gapless Web Audio with the visualizer (media.js adds
+// an element there so media keys and system controls attach). The overlay uses OutClass.
+const TOUCH_DEVICE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+  || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1) // iPadOS reports as a Mac
+  || !!window.matchMedia?.("(pointer: coarse) and (hover: none)").matches;
+const SiteOut = TOUCH_DEVICE ? ElementOut : OutClass;
+
+// 0.1 s of silence (8 kHz, 8-bit mono WAV) to unlock an <audio> element inside a click.
+const SILENCE_WAV = (() => {
+  const n = 800, b = new Uint8Array(44 + n);
+  const v = new DataView(b.buffer);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) b[o + i] = s.charCodeAt(i); };
+  str(0, "RIFF"); v.setUint32(4, 36 + n, true); str(8, "WAVEfmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, 8000, true); v.setUint32(28, 8000, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+  str(36, "data"); v.setUint32(40, n, true); b.fill(128, 44);
+  let bin = "";
+  for (const x of b) bin += String.fromCharCode(x);
+  return `data:audio/wav;base64,${btoa(bin)}`;
+})();
+
 // ---------- Server-Sent Events over fetch ----------
 // fetch (not EventSource) so an Authorization header can be sent. Reconnects with
 // backoff; a stream silent for 45 s (the server pings every 15 s) counts as dead.
 // onEvent(type, data, id): data is parsed JSON when possible, else the raw string.
 // onStatus(status, info): "connecting" | "open" | "down" ({status?: http code, error?}).
+// kick(): the page came back (unlocked, visible, online): reconnect now if the stream
+// looks dead instead of waiting for the idle timeout or the backoff.
 function streamEvents(url, headers, onEvent, onStatus = () => {}) {
-  let stopped = false, ctrl = null, timer = null, retry = 0;
+  let stopped = false, ctrl = null, timer = null, retry = 0, lastData = 0, open = false;
   const IDLE_MS = 45000;
 
   async function connect() {
     if (stopped) return;
+    clearTimeout(timer);
+    timer = null;
     ctrl = new AbortController();
     let idle = setTimeout(() => ctrl.abort(), IDLE_MS);
-    const alive = () => { clearTimeout(idle); idle = setTimeout(() => ctrl.abort(), IDLE_MS); };
+    lastData = Date.now();
+    const alive = () => { lastData = Date.now(); clearTimeout(idle); idle = setTimeout(() => ctrl.abort(), IDLE_MS); };
     let httpStatus = 0;
     onStatus("connecting", {});
     try {
@@ -269,6 +330,7 @@ function streamEvents(url, headers, onEvent, onStatus = () => {}) {
       httpStatus = r.status;
       if (!r.ok || !r.body) throw new Error(`${r.status} ${r.statusText}`.trim());
       retry = 0;
+      open = true;
       onStatus("open", { status: r.status });
       const reader = r.body.getReader();
       const dec = new TextDecoder();
@@ -307,6 +369,7 @@ function streamEvents(url, headers, onEvent, onStatus = () => {}) {
       onStatus("down", { status: httpStatus, error: e.message });
     } finally {
       clearTimeout(idle);
+      open = false;
     }
     if (stopped) return;
     // Bad keys won't fix themselves quickly: retry them slowly.
@@ -316,5 +379,12 @@ function streamEvents(url, headers, onEvent, onStatus = () => {}) {
   }
 
   connect();
-  return { close() { stopped = true; clearTimeout(timer); ctrl?.abort(); } };
+  return {
+    close() { stopped = true; clearTimeout(timer); ctrl?.abort(); },
+    kick() {
+      if (stopped) return;
+      if (timer) { retry = 0; connect(); return; }                   // waiting to retry: go now
+      if (open && Date.now() - lastData > 20000) ctrl?.abort();      // silent past a ping: reconnect
+    },
+  };
 }

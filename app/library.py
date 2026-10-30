@@ -11,11 +11,18 @@ future generator changes could otherwise not reproduce a song exactly.
 A saved song is either liked (shows in Liked songs) or only kept because a
 playlist uses it; unliking such a song keeps it for its playlists.
 
+Every row belongs to a user. `Library` is the view of one user (`user_id`,
+default the local-mode user); `lib.for_user(id)` gives another user's view on the
+same database. Songs are keyed per user by their spec hash, so two users can save
+the same song independently. `get_setting`/`set_setting` are server-wide rows;
+`user_setting`/`set_user_setting` are the view's user's own (app, AI, backups).
+
 Older JSON files (index.json, playlists.json, history.json) are imported once.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -29,6 +36,7 @@ from typing import Any, Iterator, Optional
 from pydantic import ValidationError
 
 from app import config, db as dbmod
+from app.accounts import LOCAL_ID
 from app.db import Conn, Database
 from app.schema import SongSpec
 
@@ -86,6 +94,7 @@ class Library:
         # SQLite file: used as the database, or as the source of a one-time import into Postgres.
         self.db_path = Path(db_path or (self.root / "motif.db" if root else config.DB_PATH))
         self.lock = threading.RLock()
+        self.user_id = LOCAL_ID
         legacy = self.db_path.with_name("music.db")  # the app was called "music" before it became Motif
         if self.db_path.name == "motif.db" and not self.db_path.exists() and legacy.exists():
             legacy.rename(self.db_path)
@@ -97,6 +106,14 @@ class Library:
         if self.db.dialect != "sqlite":
             self._import_local_sqlite()
         self._import_json()
+
+    def for_user(self, user_id: str) -> "Library":
+        """The same library as seen by another user (shares the database and lock)."""
+        if user_id == self.user_id:
+            return self
+        view = copy.copy(self)
+        view.user_id = user_id
+        return view
 
     @contextmanager
     def _db(self) -> Iterator[Conn]:
@@ -120,13 +137,14 @@ class Library:
     def entries(self) -> list[dict]:
         """Liked songs, newest first."""
         with self._db() as db:
-            rows = db.execute(f"SELECT {', '.join(ENTRY_FIELDS)} FROM songs WHERE liked = 1 "
-                              "ORDER BY liked_at DESC").fetchall()
+            rows = db.execute(f"SELECT {', '.join(ENTRY_FIELDS)} FROM songs WHERE user_id = ? AND liked = 1 "
+                              "ORDER BY liked_at DESC", (self.user_id,)).fetchall()
         return [dict(r) for r in rows]
 
     def get(self, song_id: str) -> Optional[dict]:
         with self._db() as db:
-            row = db.execute(f"SELECT {', '.join(ENTRY_FIELDS)} FROM songs WHERE id = ?", (song_id,)).fetchone()
+            row = db.execute(f"SELECT {', '.join(ENTRY_FIELDS)} FROM songs WHERE user_id = ? AND id = ?",
+                             (self.user_id, song_id)).fetchone()
         return dict(row) if row else None
 
     def save(self, spec: SongSpec, source: str, liked: bool = False) -> tuple[dict, bool]:
@@ -137,15 +155,15 @@ class Library:
             if existing:
                 if liked and not existing["liked"]:
                     with self._db() as db:
-                        db.execute("UPDATE songs SET liked = 1, liked_at = ? WHERE id = ?",
-                                   (entry["liked_at"], entry["id"]))
+                        db.execute("UPDATE songs SET liked = 1, liked_at = ? WHERE user_id = ? AND id = ?",
+                                   (entry["liked_at"], self.user_id, entry["id"]))
                     return self.get(entry["id"]), False
                 return existing, True
             with self._db() as db:
                 db.execute(
-                    f"INSERT INTO songs ({', '.join(ENTRY_FIELDS)}, spec) "
-                    f"VALUES ({', '.join('?' * (len(ENTRY_FIELDS) + 1))})",
-                    (*(entry[f] for f in ENTRY_FIELDS), spec.model_dump_json()),
+                    f"INSERT INTO songs ({', '.join(ENTRY_FIELDS)}, spec, user_id) "
+                    f"VALUES ({', '.join('?' * (len(ENTRY_FIELDS) + 2))})",
+                    (*(entry[f] for f in ENTRY_FIELDS), spec.model_dump_json(), self.user_id),
                 )
         return entry, False
 
@@ -156,25 +174,27 @@ class Library:
     def unlike(self, song_id: str) -> None:
         """Remove from Liked songs; the song is kept only while a playlist uses it."""
         with self.lock, self._db() as db:
-            if not db.execute("SELECT 1 FROM songs WHERE id = ?", (song_id,)).fetchone():
+            u = self.user_id
+            if not db.execute("SELECT 1 FROM songs WHERE user_id = ? AND id = ?", (u, song_id)).fetchone():
                 raise LibraryError("unknown song")
-            if db.execute("SELECT 1 FROM playlist_songs WHERE song_id = ?", (song_id,)).fetchone():
-                db.execute("UPDATE songs SET liked = 0 WHERE id = ?", (song_id,))
+            if db.execute("SELECT 1 FROM playlist_songs WHERE user_id = ? AND song_id = ?", (u, song_id)).fetchone():
+                db.execute("UPDATE songs SET liked = 0 WHERE user_id = ? AND id = ?", (u, song_id))
             else:
-                db.execute("DELETE FROM songs WHERE id = ?", (song_id,))
+                db.execute("DELETE FROM songs WHERE user_id = ? AND id = ?", (u, song_id))
 
     def spec(self, song_id: str) -> Optional[SongSpec]:
         if not SONG_ID.fullmatch(song_id):
             return None
         with self._db() as db:
-            row = db.execute("SELECT spec FROM songs WHERE id = ?", (song_id,)).fetchone()
+            row = db.execute("SELECT spec FROM songs WHERE user_id = ? AND id = ?", (self.user_id, song_id)).fetchone()
         return _parse_spec(row["spec"]) if row else None
 
     def rename_song(self, song_id: str, name: str) -> dict:
         """Rename a saved song (display name only; the audio is unchanged)."""
         name = clean_name(name)
         with self.lock, self._db() as db:
-            if db.execute("UPDATE songs SET name = ? WHERE id = ?", (name, song_id)).rowcount == 0:
+            if db.execute("UPDATE songs SET name = ? WHERE user_id = ? AND id = ?",
+                          (name, self.user_id, song_id)).rowcount == 0:
                 raise LibraryError("unknown song")
         return self.get(song_id)
 
@@ -184,23 +204,30 @@ class Library:
         Returns what was removed: {"saved": bool, "history": rows}.
         """
         with self.lock, self._db() as db:
-            saved = db.execute("DELETE FROM songs WHERE id = ?", (song_hash,)).rowcount > 0
-            history = db.execute("DELETE FROM history WHERE hash = ?", (song_hash,)).rowcount
+            saved = db.execute("DELETE FROM songs WHERE user_id = ? AND id = ?",
+                               (self.user_id, song_hash)).rowcount > 0
+            history = db.execute("DELETE FROM history WHERE user_id = ? AND hash = ?",
+                                 (self.user_id, song_hash)).rowcount
         return {"saved": saved, "history": history}
+
+    def saved_by_anyone(self, song_hash: str) -> bool:
+        """Does any user still keep this song? (Its cached audio is shared.)"""
+        with self._db() as db:
+            return db.execute("SELECT 1 FROM songs WHERE id = ? LIMIT 1", (song_hash,)).fetchone() is not None
 
     # --- playlists --------------------------------------------------------
 
     def _playlist_songs(self, db: Conn, pl_id: str) -> list[dict]:
         rows = db.execute(
             f"SELECT {', '.join('s.' + f for f in ENTRY_FIELDS)} FROM playlist_songs ps "
-            "JOIN songs s ON s.id = ps.song_id WHERE ps.playlist_id = ? ORDER BY ps.pos",
+            "JOIN songs s ON s.user_id = ps.user_id AND s.id = ps.song_id WHERE ps.playlist_id = ? ORDER BY ps.pos",
             (pl_id,),
         ).fetchall()
         return [dict(r) for r in rows]
 
     def _expand(self, db: Conn, row: dict, with_songs: bool) -> dict:
         songs = self._playlist_songs(db, row["id"])
-        out = dict(row)
+        out = {k: v for k, v in row.items() if k != "user_id"}
         out.update(count=len(songs), seconds=sum(s["music_seconds"] or 0 for s in songs),
                    genres=sorted({s["genre"] for s in songs}), song_ids=[s["id"] for s in songs])
         if with_songs:
@@ -209,7 +236,7 @@ class Library:
 
     def playlists(self) -> list[dict]:
         with self._db() as db:
-            rows = db.execute("SELECT * FROM playlists ORDER BY created").fetchall()
+            rows = db.execute("SELECT * FROM playlists WHERE user_id = ? ORDER BY created", (self.user_id,)).fetchall()
             return [self._expand(db, r, with_songs=False) for r in rows]
 
     def playlist(self, pl_id: str) -> Optional[dict]:
@@ -220,7 +247,7 @@ class Library:
                     "seconds": sum(s["music_seconds"] or 0 for s in songs),
                     "genres": sorted({s["genre"] for s in songs})}
         with self._db() as db:
-            row = db.execute("SELECT * FROM playlists WHERE id = ?", (pl_id,)).fetchone()
+            row = db.execute("SELECT * FROM playlists WHERE id = ? AND user_id = ?", (pl_id, self.user_id)).fetchone()
             return self._expand(db, row, with_songs=True) if row else None
 
     def create_playlist(self, name: str, source: Optional[str] = None, prompt: Optional[str] = None) -> dict:
@@ -229,12 +256,14 @@ class Library:
         name = clean_name(name)
         pl_id, now = uuid.uuid4().hex[:10], time.time()
         with self.lock, self._db() as db:
-            db.execute("INSERT INTO playlists (id, name, created, updated, source, prompt) VALUES (?, ?, ?, ?, ?, ?)",
-                       (pl_id, name, now, now, source, prompt))
+            db.execute("INSERT INTO playlists (id, name, created, updated, source, prompt, user_id) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?)", (pl_id, name, now, now, source, prompt, self.user_id))
         return self.playlist(pl_id)
 
     def _touch(self, db: Conn, pl_id: str) -> None:
-        if db.execute("UPDATE playlists SET updated = ? WHERE id = ?", (time.time(), pl_id)).rowcount == 0:
+        """Mark a playlist changed; also the ownership check for every playlist edit."""
+        if db.execute("UPDATE playlists SET updated = ? WHERE id = ? AND user_id = ?",
+                      (time.time(), pl_id, self.user_id)).rowcount == 0:
             raise LibraryError("unknown playlist")
 
     def rename_playlist(self, pl_id: str, name: str) -> dict:
@@ -247,7 +276,7 @@ class Library:
     def delete_playlist(self, pl_id: str) -> None:
         with self.lock, self._db() as db:
             song_ids = [r[0] for r in db.execute("SELECT song_id FROM playlist_songs WHERE playlist_id = ?", (pl_id,))]
-            if db.execute("DELETE FROM playlists WHERE id = ?", (pl_id,)).rowcount == 0:
+            if db.execute("DELETE FROM playlists WHERE id = ? AND user_id = ?", (pl_id, self.user_id)).rowcount == 0:
                 raise LibraryError("unknown playlist")
             for sid in song_ids:
                 self._drop_orphan(db, sid)
@@ -256,13 +285,13 @@ class Library:
         """Append a saved song (no duplicates)."""
         with self.lock, self._db() as db:
             self._touch(db, pl_id)
-            if not db.execute("SELECT 1 FROM songs WHERE id = ?", (song_id,)).fetchone():
+            if not db.execute("SELECT 1 FROM songs WHERE user_id = ? AND id = ?", (self.user_id, song_id)).fetchone():
                 raise LibraryError("song is not saved")
             pos = db.execute("SELECT COALESCE(MAX(pos), -1) + 1 FROM playlist_songs WHERE playlist_id = ?",
                              (pl_id,)).fetchone()[0]
-            db.execute("INSERT INTO playlist_songs (playlist_id, song_id, pos) VALUES (?, ?, ?) "
+            db.execute("INSERT INTO playlist_songs (playlist_id, song_id, pos, user_id) VALUES (?, ?, ?, ?) "
                        "ON CONFLICT DO NOTHING",
-                       (pl_id, song_id, pos))
+                       (pl_id, song_id, pos, self.user_id))
         return self.playlist(pl_id)
 
     def remove_from_playlist(self, pl_id: str, song_id: str) -> dict:
@@ -272,11 +301,11 @@ class Library:
             self._drop_orphan(db, song_id)
         return self.playlist(pl_id)
 
-    @staticmethod
-    def _drop_orphan(db: Conn, song_id: str) -> None:
-        """Forget a song that is neither liked nor in any playlist."""
-        db.execute("DELETE FROM songs WHERE id = ? AND liked = 0 AND NOT EXISTS "
-                   "(SELECT 1 FROM playlist_songs WHERE song_id = ?)", (song_id, song_id))
+    def _drop_orphan(self, db: Conn, song_id: str) -> None:
+        """Forget a song that is neither liked nor in any of the user's playlists."""
+        u = self.user_id
+        db.execute("DELETE FROM songs WHERE user_id = ? AND id = ? AND liked = 0 AND NOT EXISTS "
+                   "(SELECT 1 FROM playlist_songs WHERE user_id = ? AND song_id = ?)", (u, song_id, u, song_id))
 
     def reorder_playlist(self, pl_id: str, song_ids: list[str]) -> dict:
         with self.lock, self._db() as db:
@@ -293,46 +322,67 @@ class Library:
 
     def _insert_history(self, db: Conn, h: dict, spec_json: str | None) -> None:
         db.execute(
-            "INSERT INTO history (id, hash, name, genre, tempo, key, scale, music_seconds, source, played_at, spec) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO history (id, hash, name, genre, tempo, key, scale, music_seconds, source, played_at, spec, "
+            "user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (h.get("id"), h.get("hash"), h.get("name"), h.get("genre"), h.get("tempo"), h.get("key"), h.get("scale"),
-             h.get("music_seconds"), h.get("source"), h.get("played_at") or time.time(), spec_json),
+             h.get("music_seconds"), h.get("source"), h.get("played_at") or time.time(), spec_json, self.user_id),
         )
 
     def record_history(self, track_id: str, spec: SongSpec, source: str) -> None:
         h = {**summary(spec), "id": track_id, "hash": spec.audio_hash(), "source": source, "played_at": time.time()}
         with self.lock, self._db() as db:
-            last = db.execute("SELECT hash FROM history ORDER BY n DESC LIMIT 1").fetchone()
+            u = self.user_id
+            last = db.execute("SELECT hash FROM history WHERE user_id = ? ORDER BY n DESC LIMIT 1", (u,)).fetchone()
             if last and last["hash"] == h["hash"]:
                 return  # the same song again (re-cued on start, repeat one): one history entry is enough
             self._insert_history(db, h, spec.model_dump_json())
-            db.execute("DELETE FROM history WHERE n NOT IN (SELECT n FROM history ORDER BY n DESC LIMIT ?)",
-                       (HISTORY_MAX,))
+            db.execute("DELETE FROM history WHERE user_id = ? AND n NOT IN "
+                       "(SELECT n FROM history WHERE user_id = ? ORDER BY n DESC LIMIT ?)", (u, u, HISTORY_MAX))
 
     def history(self, limit: int = 50) -> list[dict]:
         with self._db() as db:
-            rows = db.execute(f"SELECT {', '.join(HISTORY_FIELDS)} FROM history ORDER BY n DESC LIMIT ?",
-                              (limit,)).fetchall()
+            rows = db.execute(f"SELECT {', '.join(HISTORY_FIELDS)} FROM history WHERE user_id = ? "
+                              "ORDER BY n DESC LIMIT ?", (self.user_id, limit)).fetchall()
         return [dict(r) for r in rows]
 
     def history_spec(self, track_id: str) -> Optional[tuple[SongSpec, str]]:
         with self._db() as db:
-            row = db.execute("SELECT spec, source FROM history WHERE id = ? ORDER BY n DESC LIMIT 1",
-                             (track_id,)).fetchone()
+            row = db.execute("SELECT spec, source FROM history WHERE user_id = ? AND id = ? ORDER BY n DESC LIMIT 1",
+                             (self.user_id, track_id)).fetchone()
         spec = _parse_spec(row["spec"]) if row else None
         return (spec, row["source"] or "procedural") if spec else None
 
     # --- settings ---------------------------------------------------------
 
-    def get_setting(self, key: str, default: Any = None) -> Any:
+    def _get(self, user_id: str, key: str, default: Any) -> Any:
         with self._db() as db:
-            row = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            row = db.execute("SELECT value FROM settings WHERE user_id = ? AND key = ?", (user_id, key)).fetchone()
         return json.loads(row["value"]) if row else default
 
-    def set_setting(self, key: str, value: Any) -> None:
+    def _set(self, user_id: str, key: str, value: Any) -> None:
         with self.lock, self._db() as db:
-            db.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
-                       "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, json.dumps(value)))
+            db.execute("INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?) "
+                       "ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value",
+                       (user_id, key, json.dumps(value)))
+
+    def get_setting(self, key: str, default: Any = None) -> Any:
+        """Server-wide setting."""
+        return self._get("", key, default)
+
+    def set_setting(self, key: str, value: Any) -> None:
+        self._set("", key, value)
+
+    def user_setting(self, key: str, default: Any = None) -> Any:
+        """This view's user's own setting (app, ai, backup)."""
+        return self._get(self.user_id, key, default)
+
+    def set_user_setting(self, key: str, value: Any) -> None:
+        self._set(self.user_id, key, value)
+
+    def users_with_setting(self, key: str) -> list[str]:
+        """Users that saved `key` (e.g. who has backups configured)."""
+        with self._db() as db:
+            return [r[0] for r in db.execute("SELECT user_id FROM settings WHERE key = ? AND user_id <> ''", (key,))]
 
     # --- one-time import of the old JSON files ----------------------------
 

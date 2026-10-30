@@ -26,6 +26,10 @@ async function api(path, body, method) {
     opts.body = JSON.stringify(body);
   }
   const r = await fetch(path, opts);
+  if (r.status === 401 && booted) {
+    lockOut(); // session ended: show the login view; the empty message keeps callers from toasting
+    throw new Error("");
+  }
   if (!r.ok) throw new Error(await errorText(r));
   return r.json();
 }
@@ -40,6 +44,7 @@ async function errorText(r) {
 
 let toastTimer;
 function toast(msg) {
+  if (!msg) return;
   const t = $("toast");
   t.textContent = msg;
   t.classList.add("show");
@@ -106,6 +111,16 @@ let audioFail = { id: null, at: 0 };
 const models = new Map();   // row key -> row model (for event delegation)
 let route = { name: "home" };
 let mountedRoute = "";
+let me = null;              // GET /auth/me: {user: {id, email, role}, login}
+let booted = false;         // the app (player, stream) is running for a signed-in user
+let locked = false;         // signed out; the login view is up
+let streamH = null;         // SSE handle
+const timers = [];
+let members = null;         // GET /users: {users, invites, smtp} | {error}
+let memLink = null;         // {link, email} until dismissed
+const isAdmin = () => me?.user?.role === "admin";
+const FEATURES = [["download", "Download"], ["ai", "AI"], ["api", "API"], ["backup", "Backups"], ["overlay", "Overlays"]];
+const hasFeature = (k) => (me?.features ?? me?.user?.features)?.[k] !== false; // missing = allowed
 
 // ---------- live sync: speaker / remote ----------
 // Exactly one client plays audio: the speaker. This tab is the speaker, a remote (another
@@ -141,10 +156,12 @@ function playingNow() {
 
 function ensureOut() {
   if (!out) {
-    out = new OutClass();
+    out = new SiteOut();
     out.setVolume(volume);
-    if (sinkId && OutClass.sinkSupported()) out.setSink(sinkId).catch(() => { sinkId = ""; store.set("sinkId", ""); });
+    if (sinkId && SiteOut.sinkSupported()) out.setSink(sinkId).catch(() => { sinkId = ""; store.set("sinkId", ""); });
+    if (typeof mediaAttach === "function") mediaAttach(out); // media.js: system controls, background play
   }
+  out.unlock?.(); // <audio> output: let it start later without a click (iOS)
   if (!wantPaused && out.paused && out.cur) out.resume();
   if (out.ctx && out.ctx.state === "suspended" && !wantPaused) out.ctx.resume();
   return out;
@@ -208,8 +225,32 @@ async function playHere() {
   renderPlayer();
 }
 
+// Role or features changed on the server (every event carries `account`): follow without a reload.
+function applyAccount(a) {
+  if (!a || !me || (a.id && a.id !== me.user.id)) return;
+  const feats = a.features || me.features || me.user.features;
+  if (a.role === me.user.role && JSON.stringify(feats) === JSON.stringify(me.features ?? me.user.features)) return;
+  if (a.role) me.user.role = a.role;
+  if (a.features) { me.features = a.features; if (me.user.features) me.user.features = a.features; }
+  $("download").hidden = !hasFeature("download");
+  renderAccount();
+  if (!hasFeature("download")) closeMenu();
+  settings = null;
+  if (route.name === "members") {
+    if (!canManage()) { location.hash = "#/home"; return; }
+    members = null;
+    loadMembers();
+    renderView();
+  }
+  if (route.name === "settings") {
+    loadSettings();
+    renderView();
+  }
+}
+
 function onLive(type, d) {
   if (type !== "state" || !d || typeof d !== "object") return;
+  applyAccount(d.account);
   if (live.version !== null && typeof d.version === "number" && d.version <= live.version) return;
   if (typeof d.version === "number") live.version = d.version;
   if (typeof d.library_rev === "number" && d.library_rev !== live.libraryRev) {
@@ -234,7 +275,8 @@ function onLive(type, d) {
   if (d.state) { S = d.state; afterState(); } else renderPlayer();
 }
 
-function onLiveStatus(status) {
+function onLiveStatus(status, info) {
+  if (status === "down" && info?.status === 401) { lockOut(); return; }
   if (status === "open") {
     live.up = true;
     live.version = null;
@@ -324,7 +366,8 @@ function afterState() {
 function reconcile() {
   if (!out || !S) return;
   const now = S.now, next = S.up_next;
-  if (next && next.status === "ready") out.load(next).catch(() => {});
+  // Fetch the next song ahead: it must start from memory when this one ends (maybe locked).
+  if (next && next.status === "ready" && !out.buffer(next.id)) out.load(next).then(() => tick()).catch(() => {});
   if (!now || now.status !== "ready") return;
   if (out.cur?.id === now.id || out.pending?.id === now.id || awaitingId) return;
   const buf = out.buffer(now.id);
@@ -493,7 +536,7 @@ async function loadSettings() {
     settings = { error: e.message };
   }
   backups = null;
-  if (settings?.storage?.enabled) loadBackups();
+  if (settings?.backup?.enabled) loadBackups();
   loadKeys();
   if (route.name === "settings") renderView();
 }
@@ -509,7 +552,7 @@ async function loadKeys() {
 
 async function loadBackups() {
   try {
-    backups = await api("/admin/backups");
+    backups = await api("/backups");
   } catch (e) {
     backups = { enabled: false, error: e.message, backups: [] };
   }
@@ -593,13 +636,25 @@ function parseRoute() {
   const h = location.hash.replace(/^#\/?/, "");
   const [name, ...rest] = h.split("/");
   if (name === "playlist" && rest[0]) return { name: "playlist", id: decodeURIComponent(rest.join("/")) };
-  if (["home", "history", "queue", "settings", "liked"].includes(name)) return { name };
+  if (["home", "history", "queue", "settings", "liked", "library", "members"].includes(name)) return { name };
   return { name: "home" };
+}
+
+const canManage = () => isAdmin() && !!me?.login;
+// Highlight the current page in the sidebar and tab bar (Your Library covers liked songs, playlists and history).
+function markNav() {
+  const lib = ["library", "liked", "playlist", "history"].includes(route.name);
+  for (const a of document.querySelectorAll("[data-route]")) {
+    const on = a.dataset.route === route.name || (a.dataset.route === "library" && lib);
+    a.classList.toggle("active", on);
+    if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+  }
 }
 
 let leaveOk = false;
 async function onRoute() {
   const next = parseRoute();
+  if (next.name === "members" && !canManage()) { location.hash = "#/home"; return; }
   // Leaving Settings with unsaved edits: put the hash back (no event) and ask first.
   if (route.name === "settings" && next.name !== "settings" && !leaveOk && settingsDirty()) {
     const target = location.hash;
@@ -614,11 +669,15 @@ async function onRoute() {
   const entering = next.name === "settings" && route.name !== "settings";
   route = next;
   closeMenu();
-  for (const a of document.querySelectorAll("[data-route]")) a.classList.toggle("active", a.dataset.route === route.name);
+  markNav();
   $("prompt-form").hidden = route.name !== "home"; // prompts live on Home only
   if (route.name === "settings") {
     if (entering) settings = null; // never show a stale form
     loadSettings();
+  }
+  if (route.name === "members") {
+    if (mountedRoute !== "members") { members = null; memLink = null; }
+    loadMembers();
   }
   if (route.name === "history") loadHistory();
   if (route.name === "queue") loadQueue();
@@ -638,7 +697,7 @@ function renderView() {
     view._html = null;
     view.innerHTML = skeleton(route);
   }
-  ({ home: fillHome, history: fillHistory, queue: fillQueue, settings: fillSettings, liked: fillLiked, playlist: fillPlaylist })[route.name]();
+  ({ home: fillHome, history: fillHistory, queue: fillQueue, settings: fillSettings, liked: fillLiked, playlist: fillPlaylist, library: fillLibrary, members: fillMembers })[route.name]();
 }
 
 function skeleton(r) {
@@ -659,9 +718,13 @@ function skeleton(r) {
         <div id="v-liked"></div>`;
     case "playlist":
       return `<div id="v-pl-hero"></div><div id="v-pl-actions" class="actions"></div><div id="v-pl-rows"></div>`;
+    case "members":
+      return `<h1>Members</h1><div id="v-members"></div>`;
+    case "library":
+      return `<h1>Your Library</h1><div id="v-library"></div>`;
     case "settings":
       return `<h1>Settings</h1>
-        <div id="v-app"></div><div id="v-ai"></div><div id="v-storage"></div><div id="v-backups"></div><div id="v-keys"></div>`;
+        <div id="v-account"></div><div id="v-app"></div><div id="v-ai"></div><div id="v-storage"></div><div id="v-backups"></div><div id="v-keys"></div>`;
   }
   return "";
 }
@@ -692,6 +755,25 @@ function fillHome() {
         <div class="tile-name">${esc(p.name)}${p.source === "ai" ? '<span class="tag">AI</span>' : ""}</div><div class="tile-sub">${p.count} song${p.count === 1 ? "" : "s"}</div>
         <button class="hover-play" data-a="pl-play" data-pl="${esc(p.id)}" title="Play" aria-label="Play ${esc(p.name)}" ${p.count ? "" : "disabled"}>${icon("play_arrow")}</button></div>`).join("")}</div>`
     : `<div class="empty">No playlists yet. Describe a vibe above, or use ${icon("add", "inline")} next to “Your library” or on any song.</div>`);
+}
+
+// ---------- your library (phones have no sidebar) ----------
+function fillLibrary() {
+  const playing = S?.mode?.playlist?.id;
+  const item = (href, art, name, sub, plid) => `<a href="${href}" class="lib-row${plid && plid === playing ? " playing" : ""}">
+    ${art}<span class="lib-meta"><span class="lib-name">${name}</span><span class="lib-sub">${sub}</span></span>
+    <span class="lib-go" aria-hidden="true">${icon("chevron_right")}</span></a>`;
+  const n = (c) => `${c} song${c === 1 ? "" : "s"}`;
+  setHTML($("v-library"), `<div class="actions"><button type="button" class="pill" id="lib-new">${icon("add")}New playlist</button></div>
+    <div class="lib-page">
+      ${item("#/liked", `<span class="lib-art liked-art">${icon("favorite")}</span>`, "Liked songs", `Playlist · ${n(library.length)}`)}
+      ${item("#/history", `<span class="lib-art hist-art">${icon("history")}</span>`, "Recently played", "Your last songs")}
+      ${playlists.map((p) => item(`#/playlist/${enc(p.id)}`, playlistArt("lib-art", p),
+        `${esc(p.name)}${p.source === "ai" ? '<span class="tag">AI</span>' : ""}`, `Playlist · ${n(p.count)}`, p.id)).join("")}
+    </div>
+    ${playlists.length ? "" : '<div class="empty">No playlists yet. Create one, or describe a vibe on Home to have one made for you.</div>'}`);
+  const b = $("lib-new");
+  if (b) b.onclick = () => newPlaylist(null);
 }
 
 // ---------- queue ----------
@@ -845,7 +927,8 @@ function appCardHtml(a) {
 function aiCardHtml(ai) {
   const d = ai.defaults || {};
   const keys = ai.keys || {};
-  const list = ai.backends?.length ? ai.backends : BACKENDS.map((b) => b[0]);
+  // The Claude CLI runs on the server's own login: admin only.
+  const list = (ai.backends?.length ? ai.backends : BACKENDS.map((b) => b[0])).filter((b) => b !== "claude-cli" || isAdmin());
   const own = (v, def) => (v && v !== def ? v : ""); // empty = server default
   const opts = list.map((b) => {
     const [, title] = BACKENDS.find((x) => x[0] === b) || [b, b];
@@ -855,7 +938,8 @@ function aiCardHtml(ai) {
   const presets = URL_PRESETS.map(([n, u]) => `<button type="button" class="chip" data-a="url-preset" data-url="${esc(u)}" title="${esc(u)}">${esc(n)}</button>`).join("");
   const ratio = Number(ai.ratio) || 0;
   return `<section class="card settings-card" id="ai-card" aria-labelledby="ai-h">
-    ${cardHead("ai-h", "AI generation")}
+    ${cardHead("ai-h", me?.login && !isAdmin() ? "Your AI provider" : "AI generation")}
+    ${me?.login && !isAdmin() ? '<p class="note">Your key is private to you; nobody else can use or see it.</p>' : ""}
     <fieldset class="backends"><legend class="sr-only">Backend</legend>${opts}</fieldset>
     <div class="group" data-backends="claude-cli">
       ${textField("ai-cli-model", "CLI model", own(ai.cli_model, d.cli_model), d.cli_model)}
@@ -885,16 +969,15 @@ function aiCardHtml(ai) {
 function storageCardHtml(st) {
   const keys = st.keys || {};
   return `<section class="card settings-card" id="st-card" aria-labelledby="st-h">
-    ${cardHead("st-h", "Storage (S3)")}
-    ${switchHtml("st-enabled", "Use S3 storage", st.enabled)}
+    ${cardHead("st-h", "Backups (S3)")}
+    ${switchHtml("st-enabled", "Back up to S3", st.enabled)}
     <div class="group" data-s3>
       ${textField("st-bucket", "Bucket", st.bucket || "", "my-bucket")}
       ${textField("st-prefix", "Prefix", st.prefix || "", "motif/")}
       ${textField("st-endpoint", "Endpoint URL", st.endpoint || "", "https://…", "", "text", 'inputmode="url"')}
       ${textField("st-region", "Region", st.region || "", "us-east-1")}
-      ${keyField("st-key-id", "Access key ID", keys.aws_access_key_id, "storage", "aws_access_key_id")}
-      ${keyField("st-key-secret", "Secret access key", keys.aws_secret_access_key, "storage", "aws_secret_access_key")}
-      <div class="field"><span class="flabel">Song audio</span>${switchHtml("st-media", "Store song audio in S3", st.media)}</div>
+      ${keyField("st-key-id", "Access key ID", keys.aws_access_key_id, "backup", "aws_access_key_id")}
+      ${keyField("st-key-secret", "Secret access key", keys.aws_secret_access_key, "backup", "aws_secret_access_key")}
       ${textField("st-backup-hours", "Backup every (hours)", st.backup_interval_hours ?? 0, "0", "", "number", 'min="0" step="1" inputmode="decimal"')}
     </div>
     <div class="actions"><button type="button" class="pill accent" data-a="st-save">Save</button><button type="button" class="pill" data-a="st-test" data-test>Test connection</button></div>
@@ -915,7 +998,8 @@ function backupsHtml(st) {
 }
 
 function fillSettings() {
-  if (!$("overlay-keys-card")) setHTML($("v-keys"), keysCardHtml());
+  setHTML($("v-account"), accountCardHtml());
+  setHTML($("v-keys"), keysCardHtml());
   setHTML($("overlay-list"), keysListHtml("overlay"));
   setHTML($("api-list"), keysListHtml("api"));
   if (!settings || settings.error) {
@@ -926,9 +1010,9 @@ function fillSettings() {
     return;
   }
   if (setHTML($("v-app"), appCardHtml(settings.app || {}))) initCard($("app-card"));
-  if (setHTML($("v-ai"), aiCardHtml(settings.ai || {}))) initCard($("ai-card"));
-  if (setHTML($("v-storage"), storageCardHtml(settings.storage || {}))) initCard($("st-card"));
-  setHTML($("v-backups"), backupsHtml(settings.storage || {}));
+  if (setHTML($("v-ai"), hasFeature("ai") ? aiCardHtml(settings.ai || {}) : "")) initCard($("ai-card"));
+  if (setHTML($("v-storage"), settings.backup && hasFeature("backup") ? storageCardHtml(settings.backup) : "")) initCard($("st-card"));
+  setHTML($("v-backups"), settings.backup && hasFeature("backup") ? backupsHtml(settings.backup) : "");
 }
 
 // ---------- overlays and API keys ----------
@@ -950,7 +1034,7 @@ function keysCardHtml() {
     <div id="${kind}-new"></div>
     <div id="${kind}-list" class="keylist"></div>
   </section>`;
-  return card("overlay", "Overlays", "New overlay") + card("api", "API keys", "New API key");
+  return (hasFeature("overlay") ? card("overlay", "Overlays", "New overlay") : "") + (hasFeature("api") ? card("api", "API keys", "New API key") : "");
 }
 
 function ago(ts) {
@@ -1120,6 +1204,7 @@ function restoreForm(snap) {
 }
 
 function initCard(card) {
+  if (!card) return;  // the card was just removed (feature turned off)
   card._base = formValues(card);
   if (pendingSnap[card.id]) { restoreForm(pendingSnap[card.id]); delete pendingSnap[card.id]; }
   syncCard(card);
@@ -1146,9 +1231,9 @@ function syncCard(card) {
   card.querySelector(".dirty").hidden = !dirty;
   const test = card.querySelector("[data-test]");
   if (!test) return;
-  const off = card.id === "st-card" && !settings?.storage?.enabled;
+  const off = card.id === "st-card" && !settings?.backup?.enabled;
   test.disabled = dirty || off;
-  test.title = dirty ? "Save first" : off ? "Turn S3 on and save first" : "";
+  test.title = dirty ? "Save first" : off ? "Turn backups on and save first" : "";
 }
 
 // Replace the snapshot with a server response and re-render the given card from it.
@@ -1300,6 +1385,7 @@ function renderPlayer() {
   rb.setAttribute("aria-label", REPEAT_TIP[rep]);
   renderDevice();
   renderVolume();
+  if (typeof mediaSync === "function") mediaSync(); // media.js: lock screen / notification
 }
 
 // The speaker button shows where the music plays: this tab (speaker icon), or another
@@ -1494,7 +1580,7 @@ function closeMenu() {
 }
 
 // Resolves to the input text (prompt), true (confirm) or null (cancelled).
-function ask({ title, text = "", value, ok = "OK", danger = false }) {
+function ask({ title, text = "", value, ok = "OK", danger = false, type = "text" }) {
   const d = $("dialog");
   $("dialog-title").textContent = title;
   $("dialog-text").textContent = text;
@@ -1503,6 +1589,8 @@ function ask({ title, text = "", value, ok = "OK", danger = false }) {
   const isPrompt = value !== undefined;
   input.hidden = !isPrompt;
   input.value = isPrompt ? value : "";
+  input.type = type;
+  input.autocomplete = type === "password" ? "new-password" : "off";
   const okBtn = $("dialog-ok");
   okBtn.textContent = ok;
   okBtn.className = `pill ${danger ? "danger" : "accent"}`;
@@ -1635,11 +1723,13 @@ function moreMenu(anchor, m) {
   const items = [
     { label: isPlaying(m) ? "Play / pause" : "Play", run: () => playRow(m), disabled: !ready },
     { sep: true },
-    { label: "Download MP3", run: () => download(m.id, "mp3"), disabled: !ready },
-    { label: "Download WAV", run: () => download(m.id, "wav"), disabled: !ready },
+    ...(hasFeature("download") ? [
+      { label: "Download MP3", run: () => download(m.id, "mp3"), disabled: !ready },
+      { label: "Download WAV", run: () => download(m.id, "wav"), disabled: !ready },
+    ] : []),
   ];
   if (sid) items.push({ sep: true }, { label: "Rename…", run: () => renameSong(sid, m.name) });
-  if (m.ctx === "pl") items.push({ sep: true }, { label: "Remove from playlist", run: () => removeFromPlaylist(m) });
+  if (m.ctx === "pl") items.push({ sep: true }, { label: "Move up", run: () => moveRow(m, -1), disabled: m.index === 0 }, { label: "Move down", run: () => moveRow(m, 1), disabled: !!m.last }, { sep: true }, { label: "Remove from playlist", run: () => removeFromPlaylist(m) });
   if (sid) {
     if (m.ctx !== "pl") items.push({ sep: true });
     items.push({ label: "Remove from Liked songs…", danger: true, run: () => toggleLike(m) });
@@ -1804,7 +1894,7 @@ function playOnItems() {
 
 async function deviceMenu(anchor) {
   const items = [...playOnItems(), { sep: true }];
-  if (!OutClass.sinkSupported() || !navigator.mediaDevices?.enumerateDevices) {
+  if (!SiteOut.sinkSupported() || !navigator.mediaDevices?.enumerateDevices) {
     return openMenu(anchor, [...items, { heading: "Output device" }, { note: "Switch output in system settings." }]);
   }
   const devs = await listOutputs();
@@ -1939,12 +2029,12 @@ async function saveStorage(btn) {
     body = { bucket: "" };
   } else {
     const bucket = $("st-bucket").value.trim();
-    if (!bucket) { toast("Enter a bucket name, or turn S3 storage off"); $("st-bucket").focus(); return; }
+    if (!bucket) { toast("Enter a bucket name, or turn backups off"); $("st-bucket").focus(); return; }
     const hours = parseFloat($("st-backup-hours").value || "0");
     if (!(hours >= 0)) { toast("Backup interval must be 0 or more hours"); return; }
     body = {
       bucket, prefix: $("st-prefix").value.trim() || "motif/", endpoint: $("st-endpoint").value.trim(),
-      region: $("st-region").value.trim(), media: $("st-media").checked, backup_interval_hours: hours,
+      region: $("st-region").value.trim(), backup_interval_hours: hours,
     };
     const id = $("st-key-id").value.trim(), secret = $("st-key-secret").value.trim();
     if (id) body.aws_access_key_id = id;
@@ -1952,11 +2042,11 @@ async function saveStorage(btn) {
   }
   busyBtn(btn, true);
   try {
-    const r = await api("/settings/storage", body, "PUT");
+    const r = await api("/settings/backup", body, "PUT");
     backups = null;
     applySettings(r, "v-storage");
-    toast(body.bucket ? "Storage settings saved" : "S3 storage turned off");
-    if (settings?.storage?.enabled) loadBackups();
+    toast(body.bucket ? "Backup settings saved" : "Backups turned off");
+    if (settings?.backup?.enabled) loadBackups();
   } catch (e) {
     toast(e.message);
     busyBtn(btn, false);
@@ -1969,7 +2059,7 @@ async function testStorage(btn) {
   res.textContent = "Connecting to the saved bucket…";
   busyBtn(btn, true);
   try {
-    const r = await api("/settings/storage/test", {});
+    const r = await api("/settings/backup/test", {});
     showResult("st-result", r, r.ok ? "bucket reachable" : "");
   } catch (e) {
     res.className = "result bad";
@@ -1994,7 +2084,7 @@ async function clearKey(btn) {
   const { scope, field, label } = btn.dataset;
   const yes = await ask({
     title: `Clear the saved ${label}?`,
-    text: "It is removed from this machine. If the matching environment variable is set, that is used instead. Other unsaved changes on this card are kept.",
+    text: "It is removed from this server. Other unsaved changes on this card are kept.",
     ok: "Clear", danger: true,
   });
   if (!yes) return;
@@ -2019,7 +2109,7 @@ function presetURL(btn) {
 async function backupNow(btn) {
   btn.disabled = true;
   try {
-    const { backup } = await api("/admin/backup", {});
+    const { backup } = await api("/backups", {});
     toast(`Backed up (${fmtSize(backup?.size)})`);
     await loadBackups();
   } catch (e) {
@@ -2030,13 +2120,14 @@ async function backupNow(btn) {
 }
 
 async function restore(key) {
-  const yes = await ask({ title: "Restore this backup?", text: `Your library, playlists and history will be replaced with ${key}. This can't be undone.`, ok: "Restore", danger: true });
+  const yes = await ask({ title: "Restore this backup?", text: `This replaces your likes, playlists, history and settings with ${key}. This can't be undone.`, ok: "Restore", danger: true });
   if (!yes) return;
   try {
-    await api("/admin/restore", { key });
+    await api("/backups/restore", { key });
     toast("Backup restored");
     plDetail.clear();
-    await Promise.all([loadLib(), loadHistory()]);
+    await Promise.all([loadLib(), loadHistory(), loadAppPrefs(), refresh()]);
+    loadSettings();
   } catch (e) {
     toast(e.message);
   }
@@ -2087,6 +2178,14 @@ function onClick(ev) {
     case "key-revoke": revokeKey(el); break;
     case "key-done": dismissNewKey(); break;
     case "key-new": openKeyForm(el.dataset.kind); break;
+    case "acct-pw": changePassword(el); break;
+    case "mem-invite": inviteMember(el); break;
+    case "mem-remove": removeMember(el); break;
+    case "mem-reset": resetMember(el); break;
+    case "mem-setpw": setMemberPassword(el); break;
+    case "inv-resend": resendInvite(el); break;
+    case "inv-revoke": revokeInvite(el); break;
+    case "mem-link-done": memLink = null; fillMembers(); break;
     case "key-cancel": openKeyForm(keyForm); break;
     case "copy": {
       const src = $(el.dataset.for);
@@ -2130,6 +2229,8 @@ function bind() {
     api("/repeat", { mode: next }).then((r) => { S = r; afterState(); toast(REPEAT_TIP[next]); }).catch((e) => toast(e.message));
   };
   $("new-playlist").onclick = () => newPlaylist(null);
+  $("logout").onclick = logout;
+  $("download").hidden = !hasFeature("download");
   $("prompt-form").onsubmit = (ev) => {
     ev.preventDefault();
     const text = $("prompt").value.trim();
@@ -2146,6 +2247,7 @@ function bind() {
   });
   $("view").addEventListener("change", (ev) => {
     if (ev.target.id?.startsWith("ov-")) updateOverlayURL();
+    if (ev.target.dataset?.feat) { setFeature(ev.target); return; }
     const card = ev.target.closest?.(".settings-card");
     if (card) syncCard(card);
   });
@@ -2185,12 +2287,367 @@ function bind() {
   });
 }
 
+// ---------- accounts ----------
+function until(ts) {
+  const s = ts - Date.now() / 1000;
+  if (s <= 0) return "expired";
+  if (s < 3600) return `in ${Math.max(1, Math.floor(s / 60))} min`;
+  if (s < 86400) return `in ${Math.floor(s / 3600)} h`;
+  return `in ${Math.floor(s / 86400)} d`;
+}
+
+function accountCardHtml() {
+  if (!me?.login) return "";
+  const u = me.user;
+  return `<section class="card" id="account-card" aria-labelledby="acct-h">
+    <div class="card-head"><h2 id="acct-h">Account</h2></div>
+    <div class="kv-row"><span>Email</span><span>${esc(u.email)}</span></div>
+    <div class="kv-row"><span>Role</span><span>${esc(u.role)}</span></div>
+    <h3 class="sub-h">Change password</h3>
+    <div class="field"><label for="acct-cur">Current password</label><input id="acct-cur" type="password" autocomplete="current-password"></div>
+    <div class="field"><label for="acct-new">New password</label><input id="acct-new" type="password" autocomplete="new-password" aria-describedby="acct-new-hint"><div class="hint" id="acct-new-hint">At least 8 characters.</div></div>
+    <div class="field"><label for="acct-new2">Repeat new password</label><input id="acct-new2" type="password" autocomplete="new-password"></div>
+    <div class="actions"><button type="button" class="pill accent" data-a="acct-pw">Change password</button></div>
+  </section>`;
+}
+
+async function changePassword(btn) {
+  const cur = $("acct-cur").value, next = $("acct-new").value;
+  if (!cur) { toast("Enter your current password"); $("acct-cur").focus(); return; }
+  if (next.length < 8) { toast("New password must be at least 8 characters"); $("acct-new").focus(); return; }
+  if (next !== $("acct-new2").value) { toast("The new passwords don't match"); $("acct-new2").focus(); return; }
+  busyBtn(btn, true);
+  try {
+    await api("/auth/password", { current: cur, new: next });
+    for (const id of ["acct-cur", "acct-new", "acct-new2"]) $(id).value = "";
+    toast("Password changed");
+  } catch (e) {
+    toast(e.message);
+  }
+  busyBtn(btn, false);
+}
+
+async function logout() {
+  try { await api("/auth/logout", {}); } catch { /* already signed out */ }
+  route = { name: "home" }; // nothing to confirm on the way out
+  location.hash = "#/home";
+  location.reload();
+}
+
+function renderAccount() {
+  for (const el of document.querySelectorAll(".admin-only")) el.hidden = !canManage();
+  $("account").hidden = !me?.login;
+  if (!me?.login) return;
+  $("account-email").textContent = me.user.email;
+  $("account-email").title = me.user.email;
+}
+
+// ---------- members (admin) ----------
+async function loadMembers() {
+  try {
+    members = await api("/users");
+  } catch (e) {
+    members = { error: e.message };
+  }
+  if (route.name === "members") fillMembers();
+}
+
+function membersShell() {
+  return `<section class="card" id="members-card" aria-labelledby="mem-inv-h">
+      <div class="card-head"><h2 id="mem-inv-h">Invite someone</h2></div>
+      <div id="mem-smtp"></div>
+      <div class="invite-row"><input id="invite-email" type="email" inputmode="email" placeholder="Email to invite" aria-label="Email to invite" autocomplete="off" spellcheck="false" autocapitalize="off">
+        <button type="button" class="pill accent" data-a="mem-invite">Invite</button></div>
+      <div class="invite-feats"><span class="muted small">They can use</span>
+        <div class="feat-row" role="group" aria-label="Features for the new member">${FEATURES.map(([k, l]) => `<label class="scope-chip"><input type="checkbox" data-invfeat="${k}" checked><span>${l}</span></label>`).join("")}</div></div>
+      <div id="mem-link"></div>
+    </section>
+    <section class="card" aria-labelledby="mem-h">
+      <div class="card-head"><h2 id="mem-h">Members</h2></div>
+      <div id="mem-users" class="keylist"></div>
+    </section>
+    <section class="card" aria-labelledby="mem-pend-h">
+      <div class="card-head"><h2 id="mem-pend-h">Pending invites</h2></div>
+      <div id="mem-invites" class="keylist"></div>
+    </section>`;
+}
+
+function memLinkHtml() {
+  if (!memLink) return "";
+  return `<div class="newkey" role="region" aria-label="Link for ${esc(memLink.email)}">
+    <div class="newkey-head"><b>${icon("key", "inline")} Email isn't set up — send this link yourself.</b><span class="muted small">For ${esc(memLink.email)}</span></div>
+    <div class="copy-row"><code id="mem-link-text" class="copy-text">${esc(memLink.link)}</code><button type="button" class="pill small accent" data-a="copy" data-for="mem-link-text">${icon("content_copy")}Copy</button></div>
+    <div class="actions"><button type="button" class="pill" data-a="mem-link-done">Done</button></div></div>`;
+}
+
+function fillMembers() {
+  const host = $("v-members");
+  if (!isAdmin() || !me.login) { setHTML(host, ""); return; }
+  if (!$("members-card")) { host._html = null; setHTML(host, membersShell()); }
+  setHTML($("mem-link"), memLinkHtml());
+  if (!members || members.error) {
+    const msg = members ? `Could not load members: ${esc(members.error)}` : "Loading…";
+    setHTML($("mem-smtp"), "");
+    setHTML($("mem-users"), `<div class="empty small">${msg}</div>`);
+    setHTML($("mem-invites"), "");
+    return;
+  }
+  setHTML($("mem-smtp"), members.smtp === false ? '<p class="note">Email isn\'t set up on this server, so invite and reset links are shown here for you to send yourself.</p>' : "");
+  const users = members.users || [], invites = members.invites || [];
+  setHTML($("mem-users"), users.map((u) => {
+    const self = u.id === me.user.id;
+    return `<div class="keyrow">
+      <span class="key-ico">${icon("key")}</span>
+      <div class="key-meta">
+        <div class="key-name">${esc(u.email)}${self ? ' <span class="muted small">(you)</span>' : ""}</div>
+        <div class="key-sub"><span class="kpill ${u.role === "admin" ? "admin" : ""}">${esc(u.role)}</span>
+          <span title="${u.last_login ? esc(fmtDate(u.last_login)) : ""}">${u.last_login ? `Last login ${esc(ago(u.last_login))}` : "Never logged in"}</span></div>
+      </div>
+      ${self ? "" : `<div class="feat-row" role="group" aria-label="Features for ${esc(u.email)}">${FEATURES.map(([k, l]) => `<label class="scope-chip"><input type="checkbox" data-feat="${k}" data-id="${esc(u.id)}" ${u.features?.[k] === false ? "" : "checked"}><span>${l}</span></label>`).join("")}</div>
+      <div class="row-btns"><button type="button" class="pill small" data-a="mem-reset" data-id="${esc(u.id)}" data-email="${esc(u.email)}">Send reset link</button>
+        <button type="button" class="pill small" data-a="mem-setpw" data-id="${esc(u.id)}" data-email="${esc(u.email)}">Set password</button>
+        <button type="button" class="pill small danger-text" data-a="mem-remove" data-id="${esc(u.id)}" data-email="${esc(u.email)}">Remove</button></div>`}
+    </div>`;
+  }).join("") || '<div class="empty small">No members yet.</div>');
+  setHTML($("mem-invites"), invites.map((v) => `<div class="keyrow">
+      <span class="key-ico">${icon("schedule")}</span>
+      <div class="key-meta">
+        <div class="key-name">${esc(v.email)}</div>
+        <div class="key-sub"><span title="${esc(fmtDate(v.expires))}">Expires ${esc(until(v.expires))}</span>
+          <span>${esc(featSummary(v.features))}</span></div>
+      </div>
+      <div class="row-btns"><button type="button" class="pill small" data-a="inv-resend" data-id="${esc(v.id)}" data-email="${esc(v.email)}">Resend</button>
+        <button type="button" class="pill small danger-text" data-a="inv-revoke" data-id="${esc(v.id)}" data-email="${esc(v.email)}">Revoke</button></div>
+    </div>`).join("") || '<div class="empty small">No pending invites.</div>');
+}
+
+// An email-less server returns the link instead; show it so the admin can pass it on.
+function memResult(r, email, what) {
+  memLink = r.link ? { link: r.link, email } : null;
+  fillMembers();
+  if (!r.link) toast(r.sent ? `${what} sent to ${email}` : `${what} created`);
+}
+
+// "All features", or the ones the member gets.
+function featSummary(f) {
+  const on = FEATURES.filter(([k]) => f?.[k] !== false).map(([, l]) => l);
+  return on.length === FEATURES.length ? "All features" : on.length ? on.join(", ") : "No extra features";
+}
+
+async function inviteMember(btn) {
+  const email = $("invite-email").value.trim();
+  if (!/^\S+@\S+$/.test(email)) { toast("Enter an email address"); $("invite-email").focus(); return; }
+  busyBtn(btn, true);
+  try {
+    const features = Object.fromEntries([...document.querySelectorAll("[data-invfeat]")].map((b) => [b.dataset.invfeat, b.checked]));
+    const r = await api("/users/invite", { email, features });
+    $("invite-email").value = "";
+    for (const b of document.querySelectorAll("[data-invfeat]")) b.checked = true;
+    memResult(r, email, "Invite");
+    await loadMembers();
+  } catch (e) {
+    toast(e.message);
+  }
+  busyBtn(btn, false);
+}
+
+async function resendInvite(btn) {
+  const { id, email } = btn.dataset;
+  busyBtn(btn, true);
+  try {
+    memResult(await api(`/invites/${enc(id)}/resend`, {}), email, "Invite");
+    await loadMembers();
+  } catch (e) {
+    toast(e.message);
+  }
+  busyBtn(btn, false);
+}
+
+async function revokeInvite(btn) {
+  const { id, email } = btn.dataset;
+  const yes = await ask({ title: `Revoke invite for ${email}?`, text: "The link in their email stops working.", ok: "Revoke", danger: true });
+  if (!yes) return;
+  try {
+    await api(`/invites/${enc(id)}`, undefined, "DELETE");
+    toast("Invite revoked");
+  } catch (e) {
+    toast(e.message);
+  }
+  loadMembers();
+}
+
+async function resetMember(btn) {
+  const { id, email } = btn.dataset;
+  busyBtn(btn, true);
+  try {
+    memResult(await api(`/users/${enc(id)}/reset`, {}), email, "Reset link");
+  } catch (e) {
+    toast(e.message);
+  }
+  busyBtn(btn, false);
+}
+
+async function setMemberPassword(btn) {
+  const { id, email } = btn.dataset;
+  const pw = await ask({ title: `Set a password for ${email}`, text: "At least 8 characters. They are signed out everywhere and log in with this one.",
+    value: "", ok: "Set password", type: "password" });
+  if (pw === null) return;
+  if (pw.length < 8) { toast("Use at least 8 characters"); return; }
+  try {
+    await api(`/users/${enc(id)}/password`, { password: pw }, "PUT");
+    toast(`Password set for ${email}`);
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+// Toggle saves at once; a failure puts the switch back.
+async function setFeature(box) {
+  const { feat, id } = box.dataset, on = box.checked;
+  box.disabled = true;
+  try {
+    const r = await api(`/users/${enc(id)}`, { features: { [feat]: on } }, "PATCH");
+    const u = members?.users?.find((x) => x.id === id);
+    if (u) u.features = r.user?.features || { ...u.features, [feat]: on };
+  } catch (e) {
+    box.checked = !on;
+    toast(e.message);
+  }
+  box.disabled = false;
+}
+
+async function removeMember(btn) {
+  const { id, email } = btn.dataset;
+  const yes = await ask({ title: `Remove ${email}?`, text: "Their playlists, likes, history, settings and keys are deleted for good.", ok: "Remove", danger: true });
+  if (!yes) return;
+  try {
+    await api(`/users/${enc(id)}`, undefined, "DELETE");
+    toast("Member removed");
+  } catch (e) {
+    toast(e.message);
+  }
+  loadMembers();
+}
+
+// ---------- sign-in views ----------
+function showAuth(html) {
+  document.body.classList.add("locked");
+  const a = $("auth");
+  a.hidden = false;
+  a.innerHTML = `<div class="auth-card"><div class="auth-brand"><span class="logo" aria-hidden="true"></span>Motif</div>${html}</div>`;
+}
+
+const authField = (id, label, type, extra = "") => `<div class="afield"><label for="${id}">${label}</label><input id="${id}" type="${type}" ${extra}></div>`;
+
+function showLogin(msg) {
+  showAuth(`<form id="login-form">
+    ${authField("login-email", "Email", "email", 'autocomplete="username" spellcheck="false" autocapitalize="off" required')}
+    ${authField("login-pass", "Password", "password", 'autocomplete="current-password" required')}
+    <button type="submit" class="pill accent">Log in</button>
+    <div id="login-error" class="auth-error" role="alert">${esc(msg || "")}</div>
+  </form>`);
+  const err = $("login-error");
+  $("login-email").focus();
+  $("login-form").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const btn = ev.target.querySelector("button");
+    btn.disabled = true;
+    err.textContent = "";
+    try {
+      await api("/auth/login", { email: $("login-email").value.trim(), password: $("login-pass").value });
+      location.reload();
+    } catch (e) {
+      err.textContent = e.message;
+      btn.disabled = false;
+    }
+  };
+}
+
+// Link from an invite or reset email: #/welcome?token=…
+function welcomeToken() {
+  const m = location.hash.match(/^#\/welcome(?:\?(.*))?$/);
+  return m ? new URLSearchParams(m[1] || "").get("token") || "" : null;
+}
+
+async function showWelcome(token) {
+  showAuth('<p class="sub">Checking your link…</p>');
+  let info;
+  try {
+    info = await api(`/auth/token/${enc(token)}`);
+  } catch {
+    showAuth('<h1>Link not valid</h1><p class="sub">This link has expired or was already used.</p><a class="pill" href="#/home">Go to log in</a>');
+    return;
+  }
+  const invite = info.kind === "invite";
+  showAuth(`<h1>${invite ? "You've been invited to Motif" : "Reset your password"}</h1>
+    <p class="sub">Set your password to ${invite ? "get started" : "log back in"}.</p>
+    <form id="welcome-form">
+      ${authField("w-email", "Email", "email", `value="${esc(info.email)}" readonly autocomplete="username"`)}
+      ${authField("w-pass", "Password", "password", 'autocomplete="new-password" minlength="8" required')}
+      ${authField("w-pass2", "Confirm password", "password", 'autocomplete="new-password" minlength="8" required')}
+      <button type="submit" class="pill accent">${invite ? "Create account" : "Set password"}</button>
+      <div id="welcome-error" class="auth-error" role="alert"></div>
+    </form>`);
+  const err = $("welcome-error");
+  $("w-pass").focus();
+  $("welcome-form").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const pw = $("w-pass").value;
+    if (pw.length < 8) { err.textContent = "Password must be at least 8 characters."; return; }
+    if (pw !== $("w-pass2").value) { err.textContent = "The passwords don't match."; return; }
+    const btn = ev.target.querySelector("button[type=submit]");
+    btn.disabled = true;
+    err.textContent = "";
+    try {
+      await api("/auth/token", { token, password: pw });
+      location.hash = "#/home";
+      location.reload();
+    } catch (e) {
+      err.textContent = e.message;
+      btn.disabled = false;
+    }
+  };
+}
+
+// Signed out while running: stop audio and the stream, then ask for a login.
+function lockOut() {
+  if (locked) return;
+  locked = true;
+  stopLocal();
+  streamH?.close();
+  for (const t of timers) clearInterval(t);
+  clearInterval(fallbackTimer);
+  fallbackTimer = null;
+  closeMenu();
+  showLogin();
+}
+
+async function start() {
+  const token = welcomeToken();
+  if (token !== null) { showWelcome(token); return; }
+  let r;
+  try {
+    r = await fetch("/auth/me");
+  } catch {
+    showLogin("Can't reach the server.");
+    return;
+  }
+  if (r.status === 401) { showLogin(); return; }
+  if (!r.ok) { showLogin(await errorText(r)); return; }
+  me = await r.json();
+  document.body.classList.remove("locked");
+  $("auth").hidden = true;
+  init();
+}
+
 async function init() {
+  booted = true;
   fillIcons();
+  renderAccount();
   renderVolume();
   bind();
   route = parseRoute();
-  for (const a of document.querySelectorAll("[data-route]")) a.classList.toggle("active", a.dataset.route === route.name);
+  markNav();
   renderView();
   await loadGenres();
   await refresh();
@@ -2199,9 +2656,9 @@ async function init() {
   onRoute();
   requestAnimationFrame(drawPlayerViz);
   // Live state over SSE (same origin, no key); a slow /state poll runs only while it is down.
-  streamEvents(`/events?client=${enc(CLIENT)}&kind=site`, {}, onLive, onLiveStatus);
-  setInterval(tick, 100);
-  setInterval(loadLib, 15000);
+  streamH = streamEvents(`/events?client=${enc(CLIENT)}&kind=site`, {}, onLive, onLiveStatus);
+  timers.push(setInterval(tick, 100), setInterval(loadLib, 15000));
 }
 
-init();
+window.addEventListener("hashchange", () => { if (!booted) start(); });
+start();

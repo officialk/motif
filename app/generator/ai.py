@@ -6,6 +6,9 @@ builds the song from the brief; any failure falls back to a procedural song.
 
 Backends: off | claude-cli (`claude -p`) | claude-api (anthropic SDK) | openai
 (any OpenAI-compatible /chat/completions server, e.g. Ollama).
+
+Settings and keys belong to a user and are passed into every call (`settings`,
+`creds`); there is no global or environment configuration. No settings = AI off.
 """
 
 from __future__ import annotations
@@ -14,14 +17,14 @@ import json
 import logging
 import re
 import subprocess
-import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 import httpx
 
-from app import config, credentials
 from app.generator import procedural
 from app.generator.brief import SongBrief, ai_schema, clamp_brief_dict
 from app.schema import GENRE_TEMPO, ROLE_PROGRAMS, SCALES, BassStyle, KeysStyle, SongSpec
@@ -30,6 +33,11 @@ log = logging.getLogger("motif.ai")
 
 BACKEND_NAMES = ("off", "claude-cli", "claude-api", "openai")
 PROMPT_MAX = 200
+CLAUDE_MODEL = "claude-haiku-5-5"  # claude-api default
+CLAUDE_CLI = "claude"
+CLAUDE_CLI_MODEL = "haiku"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+OPENAI_MODEL = "gpt-4o-mini"
 
 SYSTEM = (
     "You are a creative director for a generative radio. You do not write songs; you reply with exactly one "
@@ -79,65 +87,58 @@ class AISettings:
             raise ValueError("timeout must be between 1 and 120 seconds")
         self.model = (self.model or "").strip()
         self.openai_model = (self.openai_model or "").strip()
-        self.cli_model = (self.cli_model or "").strip() or config.CLAUDE_CLI_MODEL
-        self.base_url = (self.base_url or "").strip() or config.OPENAI_BASE_URL
+        self.cli_model = (self.cli_model or "").strip() or CLAUDE_CLI_MODEL
+        self.base_url = (self.base_url or "").strip() or OPENAI_BASE_URL
+        if not self.base_url.startswith(("http://", "https://")):
+            raise ValueError("base URL must start with http:// or https://")
 
     @property
     def claude_model(self) -> str:
-        return self.model or config.CLAUDE_MODEL
+        return self.model or CLAUDE_MODEL
 
     @property
     def openai_model_name(self) -> str:
-        return self.openai_model or config.OPENAI_MODEL
+        return self.openai_model or OPENAI_MODEL
 
     @property
     def effective_model(self) -> str:
         return self.openai_model_name if self.backend == "openai" else self.claude_model
 
-    @classmethod
-    def from_config(cls) -> "AISettings":
-        return cls(
-            backend=config.AI_BACKEND, ratio=config.AI_RATIO, model="", openai_model="",
-            cli_model=config.CLAUDE_CLI_MODEL,
-            base_url=config.OPENAI_BASE_URL, timeout=config.AI_TIMEOUT,
-        )
-
-    def public(self) -> dict:
+    def public(self, creds=None) -> dict:
         """Safe to send to the browser: key status ({set, source}) only, never values."""
         d = asdict(self)
         d["model"] = self.claude_model
         d["openai_model"] = self.openai_model_name
         d["backends"] = list(BACKEND_NAMES)
-        d["defaults"] = {"model": config.CLAUDE_MODEL, "openai_model": config.OPENAI_MODEL,
-                         "cli_model": config.CLAUDE_CLI_MODEL, "base_url": config.OPENAI_BASE_URL}
-        creds = credentials.current()
-        d["keys"] = {"anthropic": creds.status("anthropic_api_key"), "openai": creds.status("openai_api_key")}
+        d["defaults"] = {"model": CLAUDE_MODEL, "openai_model": OPENAI_MODEL,
+                         "cli_model": CLAUDE_CLI_MODEL, "base_url": OPENAI_BASE_URL}
+        unset = {"set": False, "source": None}
+        d["keys"] = {"anthropic": creds.status("anthropic_api_key") if creds else unset,
+                     "openai": creds.status("openai_api_key") if creds else unset}
         return d
 
     def updated(self, **changes) -> "AISettings":
         return replace(self, **changes)
 
 
-_lock = threading.Lock()
-_settings: Optional[AISettings] = None
+OFF = AISettings()
+
+# The keys of the user a call is made for (set around each backend call; never another user's).
+_creds: ContextVar = ContextVar("ai_creds", default=None)
 
 
-def get_settings() -> AISettings:
-    global _settings
-    with _lock:
-        if _settings is None:
-            try:
-                _settings = AISettings.from_config()
-            except ValueError as e:
-                log.warning("invalid AI config, AI is off: %s", e)
-                _settings = AISettings()
-        return _settings
+@contextmanager
+def _keys_of(creds) -> Iterator[None]:
+    token = _creds.set(creds)
+    try:
+        yield
+    finally:
+        _creds.reset(token)
 
 
-def set_settings(s: AISettings) -> None:
-    global _settings
-    with _lock:
-        _settings = s
+def _key(name: str) -> Optional[str]:
+    creds = _creds.get()
+    return creds.get(name) if creds is not None else None
 
 
 # --- prompt -------------------------------------------------------------
@@ -224,7 +225,7 @@ def extract_json(text: str) -> dict:
 
 def _call_cli(prompt: str, s: AISettings) -> str:
     cmd = [
-        config.CLAUDE_CLI, "-p",
+        CLAUDE_CLI, "-p",
         "--output-format", "text",
         "--model", s.cli_model,
         "--system-prompt", SYSTEM,
@@ -249,7 +250,7 @@ def _call_claude_api(prompt: str, s: AISettings) -> str:
     except ImportError as e:
         raise AIError("anthropic SDK not installed") from e
     try:
-        key = credentials.current().get("anthropic_api_key")
+        key = _key("anthropic_api_key")
         client = anthropic.Anthropic(timeout=s.timeout, max_retries=0, **({"api_key": key} if key else {}))
         msg = client.messages.create(
             model=s.claude_model,
@@ -277,7 +278,7 @@ def _call_claude_api(prompt: str, s: AISettings) -> str:
 def _call_openai(prompt: str, s: AISettings) -> str:
     url = f"{s.base_url.rstrip('/')}/chat/completions"
     headers = {}
-    key = credentials.current().get("openai_api_key")  # local servers need none
+    key = _key("openai_api_key")  # local servers need none
     if key:
         headers["Authorization"] = f"Bearer {key}"
     body = {
@@ -285,8 +286,7 @@ def _call_openai(prompt: str, s: AISettings) -> str:
         "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
         "temperature": 0.9,
     }
-    if config.OPENAI_JSON_MODE:
-        body["response_format"] = {"type": "json_object"}
+    body["response_format"] = {"type": "json_object"}  # dropped below if the server rejects it
     try:
         resp = httpx.post(url, headers=headers, json=body, timeout=s.timeout)
         if resp.status_code == 400 and "response_format" in body:
@@ -316,13 +316,14 @@ SOURCES = {"claude-cli": "claude", "claude-api": "claude", "openai": "openai"}
 # --- public API ---------------------------------------------------------
 
 def generate_brief(genre: Optional[str], prompt: Optional[str],
-                   settings: Optional[AISettings] = None) -> tuple[SongBrief, str]:
-    """Ask the configured backend for a brief. Returns (brief, source); raises AIError."""
-    s = settings or get_settings()
+                   settings: Optional[AISettings] = None, creds=None) -> tuple[SongBrief, str]:
+    """Ask the user's backend for a brief. Returns (brief, source); raises AIError."""
+    s = settings or OFF
     if s.backend not in BACKENDS:
         raise AIError("AI backend is off")
     try:
-        text = BACKENDS[s.backend](build_prompt(genre, prompt), s)
+        with _keys_of(creds):
+            text = BACKENDS[s.backend](build_prompt(genre, prompt), s)
         raw = extract_json(text)
         if genre:
             raw["genre"] = genre  # the requested genre wins
@@ -339,16 +340,17 @@ def generate_brief(genre: Optional[str], prompt: Optional[str],
 
 def generate_playlist_briefs(genre: Optional[str], prompt: Optional[str], count: int,
                              settings: Optional[AISettings] = None,
-                             existing: Optional[list[dict]] = None) -> tuple[str, list[SongBrief], str]:
+                             existing: Optional[list[dict]] = None, creds=None) -> tuple[str, list[SongBrief], str]:
     """One call for a whole playlist. Returns (title, briefs, source); raises AIError.
 
     Invalid briefs in the reply are skipped; at least one must be valid.
     """
-    s = settings or get_settings()
+    s = settings or OFF
     if s.backend not in BACKENDS:
         raise AIError("AI backend is off")
     s = replace(s, timeout=min(120.0, s.timeout * 2.5))  # a set of briefs takes longer than one
-    raw = extract_json(BACKENDS[s.backend](build_playlist_prompt(genre, prompt, count, existing), s))
+    with _keys_of(creds):
+        raw = extract_json(BACKENDS[s.backend](build_playlist_prompt(genre, prompt, count, existing), s))
     items = raw.get("songs")
     if not isinstance(items, list):
         raise AIError("reply has no songs list")
@@ -372,17 +374,18 @@ def generate_playlist_briefs(genre: Optional[str], prompt: Optional[str], count:
 
 
 def make_playlist(genre: Optional[str], prompt: Optional[str], count: int = 8,
-                  use_ai: bool = True, existing: Optional[list[dict]] = None) -> tuple[str, list[tuple[SongSpec, str]]]:
+                  use_ai: bool = True, existing: Optional[list[dict]] = None,
+                  settings: Optional[AISettings] = None, creds=None) -> tuple[str, list[tuple[SongSpec, str]]]:
     """Title + `count` distinct songs for a prompt. Never raises; missing songs are made procedurally.
 
     With `existing` (the playlist's current songs) the songs are meant to be added to that playlist.
     """
     count = min(max(count, 1), PLAYLIST_MAX)
     title, songs = "", []
-    s = get_settings()
+    s = settings or OFF
     if use_ai and s.backend != "off":
         try:
-            title, briefs, source = generate_playlist_briefs(genre, prompt, count, s, existing)
+            title, briefs, source = generate_playlist_briefs(genre, prompt, count, s, existing, creds)
             # each song follows its own mood line (falling back to the user's prompt)
             songs = [(procedural.generate(b.genre, b.mood or prompt, brief=b), source) for b in briefs]
             log.info("%s playlist %r: %d briefs", s.backend, title, len(briefs))
@@ -409,12 +412,13 @@ def default_title(prompt: Optional[str], genre: str) -> str:
     return (text[:1].upper() + text[1:])[:60]
 
 
-def make_spec(genre: Optional[str], mood: Optional[str], use_ai: bool) -> tuple[SongSpec, str]:
+def make_spec(genre: Optional[str], mood: Optional[str], use_ai: bool,
+              settings: Optional[AISettings] = None, creds=None) -> tuple[SongSpec, str]:
     """Returns (spec, source). Never raises; falls back to procedural."""
-    s = get_settings()
+    s = settings or OFF
     if use_ai and s.backend != "off":
         try:
-            brief, source = generate_brief(genre, mood, s)
+            brief, source = generate_brief(genre, mood, s, creds)
             spec = procedural.generate(brief.genre, brief.mood or mood, brief=brief)
             log.info("%s brief for %s: %r", s.backend, brief.genre, spec.name)
             return spec, source
@@ -424,12 +428,12 @@ def make_spec(genre: Optional[str], mood: Optional[str], use_ai: bool) -> tuple[
     return procedural.generate(g, mood), "procedural"
 
 
-def test_backend(settings: Optional[AISettings] = None) -> dict:
+def test_backend(settings: Optional[AISettings] = None, creds=None) -> dict:
     """One quick real call so the UI can show whether the backend works."""
-    s = settings or get_settings()
+    s = settings or OFF
     t0 = time.monotonic()
     try:
-        brief, source = generate_brief("lofi", "test", s)
+        brief, source = generate_brief("lofi", "test", s, creds)
     except AIError as e:
         return {"ok": False, "source": None, "seconds": round(time.monotonic() - t0, 2), "error": str(e)}
     return {"ok": True, "source": source, "seconds": round(time.monotonic() - t0, 2),

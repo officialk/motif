@@ -123,8 +123,8 @@ class FluidSynthEngine(Engine):
     name = "fluidsynth"
 
     def __init__(self, soundfont: Path | None = None, cache_dir: Path | None = None, gain: float = 0.4,
-                 media=None):
-        super().__init__(cache_dir, media)
+                 render_workers: int | None = None):
+        super().__init__(cache_dir, render_workers)
         self.soundfont = Path(soundfont or config.find_soundfont())
         self.gain = gain
 

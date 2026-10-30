@@ -1,15 +1,13 @@
-"""Optional S3-compatible storage (AWS S3, MinIO, Cloudflare R2, ...).
+"""Per-user backups to S3-compatible storage (AWS S3, MinIO, Cloudflare R2, ...).
 
-Layout inside the bucket, under ``S3_PREFIX`` (default ``motif/``)::
+Each user sets their own bucket, prefix, endpoint, region, keys and schedule in
+Settings -> Backups (keys encrypted, see app/credentials.py). A backup holds only
+that user's data, as a SQLite file::
 
-    <prefix>media/<hash>.mp3 | .wav        rendered audio of saved/exported songs
-    <prefix>backups/motif-YYYYmmdd-HHMMSS.db   SQLite snapshots (UTC timestamps)
+    <prefix>backups/motif-YYYYmmdd-HHMMSS.db   (UTC timestamps)
 
-With no bucket configured everything stays local and the media store is a
-no-op. Settings come from the Settings page (stored in the DB) with the S3_*
-environment variables as defaults. Credentials come from the credentials store
-(Settings) when both keys are saved there, otherwise from boto3's standard chain;
-they are never logged.
+and a restore replaces only that user's rows. Song audio is never stored in S3:
+renders are deterministic and cached locally by hash.
 """
 
 from __future__ import annotations
@@ -25,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import config
+from .credentials import S3_NAMES
 from .db import REQUIRED_TABLES  # shared with the database layer
 
 log = logging.getLogger(__name__)
@@ -43,79 +41,6 @@ def _is_missing(exc: Exception) -> bool:
     return str(err.get("Error", {}).get("Code", "")) in _MISSING_CODES
 
 
-def _content_type(name: str) -> str:
-    return "audio/wav" if name.lower().endswith(".wav") else "audio/mpeg"
-
-
-class MediaStore:
-    """Local no-op media store."""
-
-    remote: bool = False
-
-    def fetch(self, name: str, dest: Path) -> bool:
-        return False
-
-    def put(self, src: Path, name: str) -> None:
-        return None
-
-    def exists(self, name: str) -> bool:
-        return False
-
-    def delete(self, name: str) -> None:
-        pass
-
-
-class S3MediaStore(MediaStore):
-    remote = True
-
-    def __init__(self, client, bucket: str, prefix: str) -> None:
-        self.client = client
-        self.bucket = bucket
-        self.prefix = prefix
-
-    def key(self, name: str) -> str:
-        return f"{self.prefix}media/{name}"
-
-    def fetch(self, name: str, dest: Path) -> bool:
-        dest = Path(dest)
-        tmp_name = None
-        try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(dir=dest.parent, prefix=dest.name + ".", suffix=".part")
-            os.close(fd)
-            self.client.download_file(self.bucket, self.key(name), tmp_name)
-            os.replace(tmp_name, dest)
-            tmp_name = None
-            return True
-        except Exception as exc:  # never break playback over storage trouble
-            if not _is_missing(exc):
-                log.warning("S3 fetch of %s failed: %s", name, exc)
-            return False
-        finally:
-            if tmp_name:
-                Path(tmp_name).unlink(missing_ok=True)
-
-    def put(self, src: Path, name: str) -> None:
-        self.client.upload_file(
-            str(src), self.bucket, self.key(name), ExtraArgs={"ContentType": _content_type(name)}
-        )
-
-    def delete(self, name: str) -> None:
-        try:
-            self.client.delete_object(Bucket=self.bucket, Key=self.key(name))
-        except Exception as exc:  # deleting a copy must never break the app
-            log.warning("S3 delete of %s failed: %s", name, exc)
-
-    def exists(self, name: str) -> bool:
-        try:
-            self.client.head_object(Bucket=self.bucket, Key=self.key(name))
-            return True
-        except Exception as exc:
-            if not _is_missing(exc):
-                log.warning("S3 head of %s failed: %s", name, exc)
-            return False
-
-
 class BackupStore:
     def __init__(self, client, bucket: str, prefix: str) -> None:
         self.client = client
@@ -126,15 +51,15 @@ class BackupStore:
     def backup_prefix(self) -> str:
         return f"{self.prefix}backups/"
 
-    def backup(self, db: "Database | Path") -> dict:
-        """Snapshot the live database (always as a SQLite file) and upload it."""
+    def backup(self, db: "Database | Path", user_id: str) -> dict:
+        """Snapshot one user's data (as a SQLite file) and upload it."""
         now = datetime.now(timezone.utc)
         key = f"{self.backup_prefix}motif-{now:%Y%m%d-%H%M%S}.db"
         fd, tmp = tempfile.mkstemp(suffix=".db", prefix="motif-backup-")
         os.close(fd)
         Path(tmp).unlink()  # the snapshot creates it
         try:
-            _database(db).snapshot_to(Path(tmp))
+            _database(db).snapshot_user(Path(tmp), user_id)
             size = os.path.getsize(tmp)
             self.client.upload_file(tmp, self.bucket, key)
         except Exception as exc:
@@ -172,8 +97,8 @@ class BackupStore:
         out.sort(key=lambda b: (b["created"], b["key"]), reverse=True)
         return out
 
-    def restore(self, key: str, db: "Database | Path") -> None:
-        """Replace the live database content with a verified backup."""
+    def restore(self, key: str, db: "Database | Path", user_id: str) -> dict:
+        """Replace one user's data with a verified backup (theirs, or an older whole-database one)."""
         if not key.startswith(self.backup_prefix) or ".." in key or key == self.backup_prefix:
             raise StorageError("key is not a backup of this app")
         fd, tmp = tempfile.mkstemp(suffix=".db", prefix="motif-restore-")
@@ -187,7 +112,7 @@ class BackupStore:
                 raise StorageError(f"could not download backup: {exc}") from exc
             self._verify(tmp)
             try:
-                _database(db).restore_from(Path(tmp))
+                return _database(db).restore_user(Path(tmp), user_id, keep_secrets=S3_NAMES)
             except Exception as exc:  # sqlite3 / psycopg errors
                 raise StorageError(f"restore failed: {type(exc).__name__}: {exc}") from exc
         finally:
@@ -218,19 +143,20 @@ def _database(db: "Database | Path") -> "Database":
 
 
 class BackupScheduler(threading.Thread):
-    """Daemon thread that backs up the database every ``interval_hours``."""
+    """Daemon thread that backs up one user's data every ``interval_hours``."""
 
-    def __init__(self, backup_store: BackupStore, db_path: "Database | Path", interval_hours: float) -> None:
-        super().__init__(name="s3-backup", daemon=True)
+    def __init__(self, backup_store: BackupStore, db: "Database | Path", user_id: str, interval_hours: float) -> None:
+        super().__init__(name=f"s3-backup-{user_id}", daemon=True)
         self.backup_store = backup_store
-        self.db_path = db_path  # a Database, or a SQLite file path
+        self.db = db
+        self.user_id = user_id
         self.interval = max(float(interval_hours), 0.0) * 3600
         self._stop_event = threading.Event()
 
     def run(self) -> None:
         while not self._stop_event.wait(self.interval):
             try:
-                info = self.backup_store.backup(self.db_path)
+                info = self.backup_store.backup(self.db, self.user_id)
                 log.info("scheduled backup uploaded: %s", info["key"])
             except Exception as exc:
                 log.warning("scheduled backup failed: %s", exc)
@@ -240,12 +166,11 @@ class BackupScheduler(threading.Thread):
 
 
 @dataclass
-class StorageSettings:
+class BackupSettings:
     bucket: str = ""
     prefix: str = "motif/"
     endpoint: Optional[str] = None
     region: Optional[str] = None
-    media: bool = True
     backup_interval_hours: float = 0.0
 
     def __post_init__(self) -> None:
@@ -258,7 +183,6 @@ class StorageSettings:
         if self.endpoint and not self.endpoint.startswith(("http://", "https://")):
             raise ValueError("endpoint must start with http:// or https://")
         self.region = (self.region or "").strip() or None
-        self.media = bool(self.media)
         self.backup_interval_hours = float(self.backup_interval_hours or 0)
         if not 0 <= self.backup_interval_hours <= 24 * 30:
             raise ValueError("backup interval must be between 0 and 720 hours")
@@ -268,36 +192,40 @@ class StorageSettings:
         return bool(self.bucket)
 
     @classmethod
-    def from_config(cls) -> "StorageSettings":
-        return cls(bucket=config.S3_BUCKET, prefix=config.S3_PREFIX, endpoint=config.S3_ENDPOINT_URL,
-                   region=config.S3_REGION, media=config.S3_MEDIA,
-                   backup_interval_hours=config.S3_BACKUP_INTERVAL_HOURS)
+    def load(cls, saved: Optional[dict]) -> "BackupSettings":
+        """From a saved settings row (unknown fields, e.g. the old `media` switch, are ignored)."""
+        names = set(cls.__dataclass_fields__)
+        try:
+            return cls(**{k: v for k, v in (saved or {}).items() if k in names})
+        except (TypeError, ValueError):
+            log.warning("ignoring invalid saved backup settings")
+            return cls()
 
     def fields(self) -> dict:
         return asdict(self)
 
 
-def s3_client(settings: Optional[StorageSettings] = None, creds=None):
+def s3_client(settings: BackupSettings, creds=None):
+    """boto3 client with the user's saved keys only (never the server's environment or profiles)."""
     import boto3  # lazy: only needed when S3 is configured
+    from botocore.config import Config
 
-    s = settings or StorageSettings.from_config()
-    kwargs = {"endpoint_url": s.endpoint, "region_name": s.region}
-    if creds is not None:
-        key_id, secret = creds.get("aws_access_key_id"), creds.get("aws_secret_access_key")
-        if key_id and secret:
-            kwargs.update(aws_access_key_id=key_id, aws_secret_access_key=secret)
-    return boto3.client("s3", **kwargs)
+    key_id = creds.get("aws_access_key_id") if creds is not None else None
+    secret = creds.get("aws_secret_access_key") if creds is not None else None
+    if not (key_id and secret):
+        raise StorageError("enter an access key ID and secret access key")
+    return boto3.client("s3", endpoint_url=settings.endpoint, region_name=settings.region,
+                        aws_access_key_id=key_id, aws_secret_access_key=secret,
+                        config=Config(connect_timeout=10, read_timeout=60, retries={"max_attempts": 2}))
 
 
-def from_settings(settings: StorageSettings, creds=None, client=None) -> tuple[MediaStore, BackupStore | None]:
+def from_settings(settings: BackupSettings, creds=None, client=None) -> Optional[BackupStore]:
     if not settings.enabled:
-        return MediaStore(), None
-    client = client or s3_client(settings, creds)
-    media: MediaStore = S3MediaStore(client, settings.bucket, settings.prefix) if settings.media else MediaStore()
-    return media, BackupStore(client, settings.bucket, settings.prefix)
+        return None
+    return BackupStore(client or s3_client(settings, creds), settings.bucket, settings.prefix)
 
 
-def test_connection(settings: StorageSettings, creds=None, client=None) -> dict:
+def test_connection(settings: BackupSettings, creds=None, client=None) -> dict:
     """Can we reach the bucket with these settings? {ok, seconds, error?}"""
     t0 = time.monotonic()
     if not settings.enabled:
@@ -305,6 +233,8 @@ def test_connection(settings: StorageSettings, creds=None, client=None) -> dict:
     try:
         client = client or s3_client(settings, creds)
         client.list_objects_v2(Bucket=settings.bucket, Prefix=settings.prefix, MaxKeys=1)
+    except StorageError as e:
+        return {"ok": False, "seconds": round(time.monotonic() - t0, 2), "error": str(e)}
     except Exception as e:  # noqa: BLE001 - report any failure to the user
         code = (getattr(e, "response", None) or {}).get("Error", {}).get("Code")
         msg = f"{type(e).__name__}: {code}" if code else type(e).__name__
@@ -313,9 +243,3 @@ def test_connection(settings: StorageSettings, creds=None, client=None) -> dict:
 
 
 test_connection.__test__ = False  # not a pytest test
-
-
-def from_config(client=None) -> tuple[MediaStore, BackupStore | None]:
-    s = StorageSettings.from_config()
-    s.media = config.S3_MEDIA
-    return from_settings(s, None, client)
